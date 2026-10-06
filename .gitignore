@@ -1,0 +1,22 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+dist/
+*.spec
+*.exe
+*.log
+venv/
+env/
+.env
+.vscode/
+dist/
+initial-versions/
+*.egg-info/
+__MACOSX/
+pip-wheel-metadata/
+
+# PyInstaller
+*.manifest
+_MEI*
+
