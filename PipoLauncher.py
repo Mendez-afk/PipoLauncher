@@ -49,6 +49,8 @@ ruta_args = os.path.join(carpeta_pipolauncher, "launch_args.txt")  # solo si el 
 carpeta_logs = os.path.join(carpeta_pipolauncher, "logs")
 ruta_latest = os.path.join(carpeta_logs, "latest.log")
 ruta_manifiesto = os.path.join(carpeta_pipolauncher, "version_manifest.json")  # copia local para uso sin internet
+ruta_profiles = os.path.join(carpeta_minecraft, "launcher_profiles.json")      # lo exigen Forge, Fabric, NeoForge...
+carpeta_java_local = os.path.join(carpeta_pipolauncher, "java")                # Java para la PC (instaladores de mods)
 
 # Memoria que se deja libre para Windows: lo mayor entre RESERVA_MIN_GB y RESERVA_PORC del total.
 # Ej: 8 GB -> máx 6 | 16 GB -> máx 12 | 32 GB -> máx 24 | 4 GB -> máx 2
@@ -57,13 +59,14 @@ RESERVA_PORC = 0.25
 
 # Enlace que se abre (en el navegador por defecto) al tocar el logo y el título de la ventana principal
 URL_CANAL = "https://www.youtube.com/@UncleJuan67"
-# Enlace al repositorio de Github del launcher (botón ⓘ de la ventana principal)
-URL_INFO = "https://github.com/Mendez-afk/PipoLauncher"
+# Documento de INFORMACIÓN GENERAL del launcher (botón ⓘ de la ventana principal)
+URL_INFO = "https://docs.google.com/document/d/15ZFAZeOLnyqWE65hsw_oNzN-XbaXkS0q/edit?usp=sharing"
 
 # Servidores de Mojang y ajustes del instalador
 URL_MANIFIESTO = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
 URL_JAVA = "https://launchermeta.mojang.com/v1/products/java-runtime/2ec0cc96c44e5a76b9c8b7c39df7210883d12871/all.json"
 URL_ASSETS = "https://resources.download.minecraft.net/"
+URL_ADOPTIUM = "https://api.adoptium.net/v3"   # Eclipse Temurin: Java para instalar en la PC si no hay ninguno
 PLATAFORMA_JAVA = "windows-x64"   # carpeta que usa Mojang para los runtimes de Java en Windows 64 bits
 HILOS_DESCARGA = 16               # descargas simultáneas
 # Java que usa cada runtime oficial (para mostrar un nombre claro en la pantalla de carga)
@@ -83,7 +86,7 @@ TIPOS_VANILLA = ("release",)
 # CONFIGURACIÓN (usuario, RAM, última versión elegida, logs)
 # ---------------------------------------------------------------------------
 def cargar_config():
-    cfg = {"usuario": "Invitado", "ram": 4, "version": "", "logs": True, "instalado": False}
+    cfg = {"usuario": "Invitado", "ram": 4, "version": "", "logs": True, "instalado": False, "java_local": False}
     if os.path.exists(ruta_config):
         try:
             with open(ruta_config, "r", encoding="utf-8") as f:
@@ -108,6 +111,7 @@ def cargar_config():
         cfg["ram"] = 4
     cfg["logs"] = bool(cfg.get("logs", True))
     cfg["instalado"] = bool(cfg.get("instalado", False))
+    cfg["java_local"] = bool(cfg.get("java_local", False))
     return cfg
 
 def guardar_config(cfg):
@@ -382,8 +386,13 @@ def construir_comando(vid, usuario, ram, uuid_jugador, con_logs=False):
         candidatos_jar.append(os.path.join(carpeta_versiones, data["jar"], data["jar"] + ".jar"))
     candidatos_jar += [os.path.join(carpeta_versiones, v, v + ".jar") for v in data["_cadena"]]
     jar = next((p for p in candidatos_jar if os.path.isfile(p)), None)
+    # Forge/NeoForge modernos (1.17+) arrancan con BootstrapLauncher y arman el módulo 'minecraft' ellos mismos
+    # (libraries\net\minecraft\client\...-srg.jar). Si el .jar vanilla también va en el classpath, Java lo toma como
+    # un segundo módulo ("_1._20._1") y falla con ResolutionException: dos módulos exportan net.minecraft.client.main.
+    arranque_modular = "bootstraplauncher" in str(data.get("mainClass", "")).lower()
     if jar:
-        cp.append(jar)
+        if not arranque_modular:
+            cp.append(jar)
     else:
         faltan.append(candidatos_jar[0])
 
@@ -543,6 +552,195 @@ def construir_lista(manifiesto):
 # ---------------------------------------------------------------------------
 # INSTALADOR (.minecraft: versiones, librerías, assets y Java)
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# launcher_profiles.json: los instaladores de Forge, Fabric, NeoForge... se niegan a instalar si no existe
+# ---------------------------------------------------------------------------
+def asegurar_launcher_profiles():
+    """Crea .minecraft\\launcher_profiles.json si falta (o lo repara si está dañado). Si ya existe y es válido
+    no se toca nada de lo que tenga (perfiles de otros launchers incluidos): solo se completan claves que falten."""
+    por_defecto = {
+        "profiles": {},
+        "settings": {"crashAssistance": False, "enableAdvanced": False, "enableAnalytics": False,
+                     "enableHistorical": False, "enableReleases": True, "enableSnapshots": False,
+                     "keepLauncherOpen": False, "profileSorting": "ByLastPlayed", "showGameLog": False,
+                     "showMenu": False, "soundOn": False},
+        "launcherVersion": {"format": 21, "name": "PipoLauncher", "profilesFormat": 2},
+        "authenticationDatabase": {},
+        "version": 3,
+    }
+    try:
+        os.makedirs(carpeta_minecraft, exist_ok=True)
+        existe = os.path.isfile(ruta_profiles)
+        data = {}
+        if existe:
+            try:
+                with open(ruta_profiles, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except (OSError, ValueError):
+                data = None
+            if not isinstance(data, dict):  # dañado: se guarda una copia y se rehace
+                try:
+                    os.replace(ruta_profiles, ruta_profiles + ".bak")
+                except OSError:
+                    pass
+                data = {}
+        cambio = not existe
+        for clave, valor in por_defecto.items():
+            if not isinstance(data.get(clave), type(valor)):
+                data[clave] = valor
+                cambio = True
+        if cambio:
+            tmp = ruta_profiles + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, ruta_profiles)
+        return True
+    except OSError:
+        return False
+
+# ---------------------------------------------------------------------------
+# JAVA LOCAL (el de la PC, no el de los runtimes de Mojang): lo necesitan los instaladores de mods
+# ---------------------------------------------------------------------------
+# Versiones de Temurin (Adoptium) disponibles para Windows según arquitectura, de la más nueva a la más vieja.
+JAVA_PC_DISPONIBLE = {"x64": (25, 21, 17, 11, 8), "aarch64": (25, 21, 17), "x32": (21, 17, 11, 8)}
+
+def version_java_de(exe):
+    """Versión mayor de un java.exe, ejecutándolo de verdad. None si no existe o no funciona."""
+    try:
+        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        r = subprocess.run([exe, "-version"], capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=20, creationflags=flags, stdin=subprocess.DEVNULL)
+    except Exception:
+        return None
+    m = re.search(r'version "(\d+)(?:\.(\d+))?', (r.stderr or "") + (r.stdout or ""))
+    if r.returncode != 0 or not m:
+        return None
+    mayor = int(m.group(1))
+    return int(m.group(2) or 0) if mayor == 1 else mayor  # "1.8.0_x" => Java 8
+
+def buscar_java_sistema():
+    """Busca un Java que ya funcione en la PC (JAVA_HOME, PATH, registro, carpetas habituales y el que instala
+    el propio launcher). Devuelve (ruta de java.exe, versión mayor) o None. Sirve cualquier Java 8 o superior."""
+    cand = []
+    jh = os.getenv("JAVA_HOME")
+    if jh:
+        cand.append(os.path.join(jh, "bin", "java.exe"))
+    en_path = shutil.which("java")
+    if en_path:
+        cand.append(en_path)
+    try:
+        import winreg
+        for clave in (r"SOFTWARE\JavaSoft\JDK", r"SOFTWARE\JavaSoft\Java Runtime Environment", r"SOFTWARE\JavaSoft\JRE"):
+            for vista in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+                try:
+                    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, clave, 0, winreg.KEY_READ | vista) as k:
+                        ver = winreg.QueryValueEx(k, "CurrentVersion")[0]
+                        with winreg.OpenKey(k, ver) as kv:
+                            cand.append(os.path.join(winreg.QueryValueEx(kv, "JavaHome")[0], "bin", "java.exe"))
+                except OSError:
+                    continue
+    except ImportError:
+        pass
+    raices = [os.getenv("ProgramFiles"), os.getenv("ProgramW6432"), os.getenv("ProgramFiles(x86)"),
+              os.path.join(carpeta_local, "Programs") if carpeta_local else None]
+    marcas = ("java", "jdk", "jre", "temurin", "adoptium", "zulu", "corretto", "semeru", "microsoft",
+              "openjdk", "bellsoft", "liberica")
+    for raiz in filter(None, raices):
+        try:
+            nivel1 = os.listdir(raiz)
+        except OSError:
+            continue
+        for n1 in nivel1:
+            if not any(m in n1.lower() for m in marcas):
+                continue
+            p1 = os.path.join(raiz, n1)
+            cand.append(os.path.join(p1, "bin", "java.exe"))
+            try:
+                for n2 in os.listdir(p1):
+                    cand.append(os.path.join(p1, n2, "bin", "java.exe"))
+            except OSError:
+                pass
+    try:  # el que instala el propio PipoLauncher
+        for n in os.listdir(carpeta_java_local):
+            cand.append(os.path.join(carpeta_java_local, n, "bin", "java.exe"))
+    except OSError:
+        pass
+
+    vistos = set()
+    for exe in cand:
+        clave = os.path.normcase(os.path.abspath(exe))
+        if clave in vistos or not os.path.isfile(exe):
+            continue
+        vistos.add(clave)
+        mayor = version_java_de(exe)
+        if mayor and mayor >= 8:
+            return exe, mayor
+    return None
+
+def arch_windows():
+    """Arquitectura REAL del equipo en el vocabulario de Adoptium (x64 / aarch64 / x32), aunque Python sea de 32 bits."""
+    a = (os.getenv("PROCESSOR_ARCHITEW6432") or os.getenv("PROCESSOR_ARCHITECTURE") or platform.machine()).lower()
+    if a in ("amd64", "x86_64"):
+        return "x64"
+    if a in ("arm64", "aarch64"):
+        return "aarch64"
+    return "x32"
+
+def java_candidatos():
+    """(arquitectura, [versiones de Java a probar, de la mejor a la más conservadora]) según el hardware y la
+    versión de Windows: Java 25/21 piden Windows 10+, Java 17 Windows 8.1+, Java 11 Windows 7+."""
+    arch = arch_windows()
+    try:
+        w = sys.getwindowsversion()
+        ver = (w.major, w.minor)
+    except AttributeError:
+        ver = (10, 0)
+    tope = 99 if ver >= (10, 0) else 17 if ver >= (6, 3) else 11 if ver >= (6, 1) else 8
+    return arch, [v for v in JAVA_PC_DISPONIBLE.get(arch, (17, 11, 8)) if v <= tope] or [8]
+
+def registrar_java_usuario(java_exe):
+    """Deja el Java instalado por el launcher usable desde Windows SIN permisos de administrador (solo el usuario
+    actual): JAVA_HOME y PATH, y la apertura de archivos .jar (doble clic al instalador de Forge) si ningún otro
+    programa la tiene. Es 'mejor esfuerzo': si algo falla, el Java queda instalado igual."""
+    try:
+        import winreg
+    except ImportError:
+        return
+    try:
+        bin_dir = os.path.dirname(java_exe)
+        home = os.path.dirname(bin_dir)
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0,
+                            winreg.KEY_READ | winreg.KEY_SET_VALUE) as k:
+            try:
+                path_actual = winreg.QueryValueEx(k, "Path")[0]
+            except OSError:
+                path_actual = ""
+            if os.path.normcase(bin_dir) not in [os.path.normcase(p.strip()) for p in path_actual.split(";")]:
+                nuevo = (path_actual.rstrip(";") + ";" if path_actual else "") + bin_dir
+                winreg.SetValueEx(k, "Path", 0, winreg.REG_EXPAND_SZ, nuevo)
+            try:
+                winreg.QueryValueEx(k, "JAVA_HOME")
+            except OSError:
+                winreg.SetValueEx(k, "JAVA_HOME", 0, winreg.REG_SZ, home)
+        try:  # avisar a Windows para que las ventanas nuevas lean las variables
+            ctypes.windll.user32.SendMessageTimeoutW(0xFFFF, 0x1A, 0, "Environment", 2, 5000, None)
+        except Exception:
+            pass
+        try:
+            winreg.CloseKey(winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, ".jar"))
+        except OSError:  # nadie abre .jar todavía: se asocia al Java del launcher
+            javaw = os.path.join(bin_dir, "javaw.exe")
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\Classes\.jar") as k:
+                winreg.SetValue(k, "", winreg.REG_SZ, "jarfile")
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\Classes\jarfile\shell\open\command") as k:
+                winreg.SetValue(k, "", winreg.REG_SZ, f'"{javaw}" -jar "%1" %*')
+            try:
+                ctypes.windll.shell32.SHChangeNotify(0x08000000, 0, None, None)
+            except Exception:
+                pass
+    except OSError:
+        pass
+
 class Cancelado(Exception):
     pass
 
@@ -635,15 +833,15 @@ class Instalador:
                 return m
             raise
 
-    def _descargar(self, url, destino, sha1=None, size=0, contar=False):
-        """Descarga a un .part, verifica el SHA1 y recién ahí lo mueve a su lugar definitivo."""
+    def _descargar(self, url, destino, sha1=None, size=0, contar=False, algo="sha1"):
+        """Descarga a un .part, verifica el hash (SHA1 por defecto) y recién ahí lo mueve a su lugar definitivo."""
         os.makedirs(os.path.dirname(destino), exist_ok=True)
         tmp = destino + ".part"
         ultimo_error = None
         for intento in range(3):
             local = 0
             try:
-                h = hashlib.sha1()
+                h = hashlib.new(algo)
                 req = urllib.request.Request(url, headers={"User-Agent": "PipoLauncher/1.0"})
                 with urllib.request.urlopen(req, timeout=30) as r, open(tmp, "wb") as f:
                     while True:
@@ -836,8 +1034,81 @@ class Instalador:
                               raw.get("sha1"), raw.get("size", 0))
         return list(tareas.values())
 
+    # ----- Java de la PC (para instaladores de Forge, etc.) -----
+    def _instalar_java_local(self, mayor, arch):
+        """Baja Temurin 'mayor' (JRE; si no hay, JDK) y lo deja en .minecraft\\Pipolauncher\\java\\java-<mayor>.
+        Devuelve la ruta de java.exe, ya probado. Lanza excepción si no se puede (el llamador baja de versión)."""
+        self._fase(f"Preparando Java {mayor}", "Consultando Eclipse Temurin…")
+        paquete = None
+        for tipo in ("jre", "jdk"):
+            lista = self._json(f"{URL_ADOPTIUM}/assets/latest/{mayor}/hotspot?architecture={arch}"
+                               f"&image_type={tipo}&os=windows&vendor=eclipse")
+            if isinstance(lista, list) and lista:
+                pkg = lista[0]["binary"]["package"]
+                if str(pkg.get("name", "")).lower().endswith(".zip"):
+                    paquete = pkg
+                    break
+        if not paquete:
+            raise ErrorVersion(f"No hay un paquete de Java {mayor} para {arch}")
+
+        destino = os.path.join(carpeta_java_local, f"java-{mayor}")
+        tmp = destino + ".tmp"
+        zip_ruta = os.path.join(carpeta_java_local, f"temurin-{mayor}.zip")
+        with self._lock:
+            self._total_archivos, self._total_bytes = 1, max(paquete.get("size", 0), 1)
+            self._hechos = self._bytes = 0
+        try:
+            self._fase(f"Descargando Java {mayor}")
+            self._descargar(paquete["link"], zip_ruta, paquete.get("checksum"), paquete.get("size", 0),
+                            contar=True, algo="sha256")
+            self._fase(f"Instalando Java {mayor}", "Extrayendo archivos…")
+            shutil.rmtree(tmp, ignore_errors=True)
+            shutil.rmtree(destino, ignore_errors=True)
+            with zipfile.ZipFile(zip_ruta) as z:
+                z.extractall(tmp)
+            raiz = next((os.path.join(tmp, n) for n in os.listdir(tmp)
+                         if os.path.isfile(os.path.join(tmp, n, "bin", "java.exe"))), None)
+            if raiz is None:
+                raise ErrorVersion("El paquete de Java descargado no tiene java.exe")
+            os.replace(raiz, destino)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            self._borrar(zip_ruta)
+        exe = os.path.join(destino, "bin", "java.exe")
+        if version_java_de(exe) is None:  # bajó bien pero no corre en este equipo => se prueba una versión menor
+            shutil.rmtree(destino, ignore_errors=True)
+            raise ErrorVersion(f"Java {mayor} no funciona en este equipo")
+        return exe
+
+    def asegurar_java_local(self):
+        """Si la PC ya tiene un Java que funciona, no hace nada más. Si no, instala el mejor Java disponible para
+        su hardware y su Windows (empezando por el más nuevo, p. ej. 25) y baja de versión si algo falla.
+        Devuelve {'ruta', 'mayor', 'origen': 'sistema' | 'instalado'} o None si no se pudo instalar ninguno."""
+        self._fase("Revisando Java del sistema", "Buscando Java en tu PC…")
+        hallado = buscar_java_sistema()
+        if self._cancelar.is_set():
+            raise Cancelado()
+        if hallado:
+            self._log(f"Java local detectado: {hallado[0]} (Java {hallado[1]})")
+            return {"ruta": hallado[0], "mayor": hallado[1], "origen": "sistema"}
+        arch, versiones = java_candidatos()
+        self._log(f"La PC no tiene Java. Arquitectura {arch}; se probará: {', '.join(map(str, versiones))}")
+        for mayor in versiones:
+            try:
+                exe = self._instalar_java_local(mayor, arch)
+            except Cancelado:
+                raise
+            except Exception as e:
+                self._log(f"No se pudo instalar Java {mayor}: {e}. Se prueba con una versión anterior.")
+                continue
+            registrar_java_usuario(exe)
+            self._log(f"Java {mayor} instalado en {exe}")
+            return {"ruta": exe, "mayor": mayor, "origen": "instalado"}
+        self._log("No se pudo instalar ninguna versión de Java en la PC")
+        return None
+
     # ----- proceso completo -----
-    def ejecutar(self, vids=(), java_extra=(), estricto=False):
+    def ejecutar(self, vids=(), java_extra=(), estricto=False, java_local=False):
         """Completa .minecraft para las versiones 'vids' (.json, librerías, assets, Java y .jar) más los
         runtimes de 'java_extra'. Con vids=() solo prepara Java (primer inicio). Con estricto=True
         (descarga de una versión puntual) cualquier problema con la versión lanza una excepción.
@@ -847,7 +1118,18 @@ class Instalador:
             open(os.path.join(carpeta_logs, "instalador.log"), "w").close()
         except OSError:
             pass
-        res = {"descargados": 0, "mb": 0, "errores": [], "java": [], "manifiesto": None}
+        res = {"descargados": 0, "mb": 0, "errores": [], "java": [], "manifiesto": None, "java_local": None}
+        asegurar_launcher_profiles()
+        if java_local:  # primero, antes de tocar la red de Mojang: si la PC ya tiene Java no se descarga nada
+            try:
+                res["java_local"] = self.asegurar_java_local()
+            except Cancelado:
+                raise
+            except Exception:
+                self._log("Error al preparar el Java de la PC:\n" + traceback.format_exc())
+            finally:
+                with self._lock:  # el contador de progreso vuelve a cero para las descargas siguientes
+                    self._total_archivos = self._total_bytes = self._hechos = self._exitos = self._bytes = 0
         self._fase("Analizando", "Conectando con los servidores de Mojang…")
         for d in (carpeta_versiones, carpeta_libs, carpeta_assets):
             os.makedirs(d, exist_ok=True)
@@ -993,6 +1275,7 @@ C_GRIS = "#9db89d"
 
 def main():
     cfg = cargar_config()
+    asegurar_launcher_profiles()  # Forge & cía. no se instalan sin este archivo
     total_ram = ram_total_gb()
     ram_max = ram_maxima_gb(total_ram)
     cfg["ram"] = max(1, min(cfg["ram"], ram_max))  # por si el tope cambió desde la última vez
@@ -1417,23 +1700,38 @@ def main():
     # ----- preparación inicial y verificación -----
     def preparar():
         """Primer inicio: solo lo necesario para jugar (Java). Las versiones se bajan desde la lista."""
+        primera = not cfg["instalado"]
+
         def fin(salida):
             aplicar_resultado(salida)
             if problema(salida, preparar,
                         "No se completó la preparación.\n\nSe reintentará la próxima vez que abras el launcher "
                         "(mientras tanto, cada versión baja su propio Java al descargarla)."):
                 return
-            cfg["instalado"] = True
-            guardar_config(cfg)
             res = salida["res"]
+            jl = res.get("java_local")
+            cfg["instalado"] = True
+            cfg["java_local"] = bool(jl)  # si falló, se reintenta al abrir el launcher la próxima vez
+            guardar_config(cfg)
             java_txt = ", ".join(str(j) for j in res["java"]) or "-"
-            messagebox.showinfo(
-                "¡Bienvenido a PipoLauncher!",
-                "¡Bienvenido! Ya está lo necesario para jugar.\n\n"
-                f"  •  Java: {java_txt}\n\n"
-                "La lista muestra todas las versiones de Minecraft. Las que tienen [+] todavía no están "
-                "instaladas: al elegirlas aparece «Descargar y jugar».")
-        correr_trabajo(lambda inst: inst.ejecutar(java_extra=JAVA_PRECARGADOS), fin)
+            if jl and jl["origen"] == "instalado":
+                java_pc = (f"  •  Java {jl['mayor']} instalado en tu PC (para instalar Forge y otros mods).\n"
+                           "     Si vas a ejecutar un instalador, abrilo desde una ventana nueva.\n")
+            elif jl:
+                java_pc = f"  •  Java detectado en tu PC (versión {jl['mayor']}): no hizo falta instalar otro.\n"
+            else:
+                java_pc = ("  •  No se pudo instalar Java en tu PC (Forge lo necesita). "
+                           "Se reintentará al abrir el launcher.\n")
+            if primera:
+                messagebox.showinfo(
+                    "¡Bienvenido a PipoLauncher!",
+                    "¡Bienvenido! Ya está lo necesario para jugar.\n\n"
+                    f"  •  Java del juego: {java_txt}\n{java_pc}\n"
+                    "La lista muestra todas las versiones de Minecraft. Las que tienen [+] todavía no están "
+                    "instaladas: al elegirlas aparece «Descargar y jugar».")
+            elif jl and jl["origen"] == "instalado":
+                messagebox.showinfo("Java instalado", java_pc.replace("  •  ", "").strip())
+        correr_trabajo(lambda inst: inst.ejecutar(java_extra=JAVA_PRECARGADOS, java_local=True), fin)
 
     def verificar_archivos():
         """Revisa las versiones instaladas (librerías, recursos y Java), repara lo que falte y actualiza la lista."""
@@ -1565,7 +1863,7 @@ def main():
     ventana.protocol("WM_DELETE_WINDOW", al_cerrar)
 
     refrescar_lista()
-    if not cfg["instalado"]:
+    if not cfg["instalado"] or not cfg["java_local"]:  # 2º caso: instalaciones anteriores sin revisar el Java de la PC
         ventana.after(300, preparar)
     else:
         refrescar_en_segundo_plano()
