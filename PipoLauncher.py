@@ -67,6 +67,15 @@ URL_MANIFIESTO = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.jso
 URL_JAVA = "https://launchermeta.mojang.com/v1/products/java-runtime/2ec0cc96c44e5a76b9c8b7c39df7210883d12871/all.json"
 URL_ASSETS = "https://resources.download.minecraft.net/"
 URL_ADOPTIUM = "https://api.adoptium.net/v3"   # Eclipse Temurin: Java para instalar en la PC si no hay ninguno
+
+# Actualizaciones del propio launcher (GitHub Releases).
+# IMPORTANTE: subí VERSION en cada release, antes de compilar el .exe, y que coincida con el tag de la release
+# (ej. VERSION = "1.1.0"  ->  tag "v1.1.0"). Si no coinciden, el launcher se ofrecería actualizar a sí mismo en bucle.
+VERSION = "1.1.2"
+GITHUB_REPO = "Mendez-afk/PipoLauncher"
+ASSET_EXE = "PipoLauncher.exe"   # nombre del .exe que se sube como archivo de la release
+URL_RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+URL_RELEASES_WEB = f"https://github.com/{GITHUB_REPO}/releases/latest"
 PLATAFORMA_JAVA = "windows-x64"   # carpeta que usa Mojang para los runtimes de Java en Windows 64 bits
 HILOS_DESCARGA = 16               # descargas simultáneas
 # Java que usa cada runtime oficial (para mostrar un nombre claro en la pantalla de carga)
@@ -404,7 +413,7 @@ def construir_comando(vid, usuario, ram, uuid_jugador, con_logs=False):
         "auth_uuid": uuid_jugador, "auth_access_token": "0", "auth_session": "0",
         "clientid": "0", "auth_xuid": "0", "user_type": "legacy", "user_properties": "{}",
         "version_type": data.get("type", "release"), "natives_directory": natives_dir,
-        "launcher_name": "PipoLauncher", "launcher_version": "1.0",
+        "launcher_name": "PipoLauncher", "launcher_version": VERSION,
         "classpath": sep.join(cp), "classpath_separator": sep, "library_directory": carpeta_libs,
         "game_assets": os.path.join(carpeta_assets, "virtual", (data.get("assetIndex") or {}).get("id") or "legacy"),
     }
@@ -462,6 +471,119 @@ def iniciar(cmd, registro=None):
     hilo = threading.Thread(target=leer, daemon=True)
     hilo.start()
     return proc, hilo
+
+# ---------------------------------------------------------------------------
+# ACTUALIZACIONES DEL LAUNCHER (GitHub Releases)
+# ---------------------------------------------------------------------------
+def version_a_tupla(s):
+    """'v1.2.10' -> (1, 2, 10, 0). Se compara como números, no como texto ('1.10' > '1.9')."""
+    nums = [int(n) for n in re.findall(r"\d+", str(s))[:4]]
+    return tuple((nums + [0] * 4)[:4])
+
+def limpiar_notas(md, maximo=700):
+    """Notas de la release (Markdown) -> texto simple y corto para mostrar en la ventana."""
+    t = re.sub(r"[#*`>]+", "", md or "").replace("\r", "")
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
+    return t if len(t) <= maximo else t[:maximo].rstrip() + "…"
+
+def buscar_actualizacion(timeout=8):
+    """Consulta la última release publicada. Devuelve un dict si es MÁS NUEVA que VERSION, si no None.
+    Cualquier fallo (sin internet, límite de la API, JSON raro) se ignora: el launcher abre igual."""
+    req = urllib.request.Request(URL_RELEASES_API, headers={
+        "User-Agent": f"PipoLauncher/{VERSION}", "Accept": "application/vnd.github+json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            rel = json.loads(r.read().decode("utf-8"))
+        if not isinstance(rel, dict) or rel.get("draft") or rel.get("prerelease"):
+            return None
+        tag = str(rel.get("tag_name") or "")
+        if not re.search(r"\d", tag) or version_a_tupla(tag) <= version_a_tupla(VERSION):
+            return None
+        asset = next((a for a in rel.get("assets") or []
+                      if str(a.get("name", "")).lower() == ASSET_EXE.lower()), None)
+        digest = str((asset or {}).get("digest") or "").lower()
+        return {
+            "tag": tag,
+            "titulo": str(rel.get("name") or tag),
+            "notas": limpiar_notas(rel.get("body")),
+            "pagina": str(rel.get("html_url") or URL_RELEASES_WEB),
+            "url": (asset or {}).get("browser_download_url"),
+            "size": int((asset or {}).get("size") or 0),
+            "sha256": digest.split(":", 1)[1] if digest.startswith("sha256:") else "",
+        }
+    except Exception:
+        return None
+
+def puede_autoactualizar(info):
+    """Solo se reemplaza a sí mismo el .exe compilado, con asset en la release y carpeta con permiso de escritura."""
+    return bool(getattr(sys, "frozen", False) and os.name == "nt" and info.get("url")
+                and os.access(os.path.dirname(sys.executable), os.W_OK))
+
+def descargar_actualizacion(info, progreso, cancelar):
+    """Baja el .exe nuevo a .minecraft\\Pipolauncher\\PipoLauncher.exe.nuevo y lo valida (tamaño, SHA-256 si la
+    release lo publica, y que sea un ejecutable). Devuelve la ruta. Lanza InterruptedError si se cancela."""
+    os.makedirs(carpeta_pipolauncher, exist_ok=True)
+    nuevo = os.path.join(carpeta_pipolauncher, ASSET_EXE + ".nuevo")
+    parcial = nuevo + ".part"
+    req = urllib.request.Request(info["url"], headers={"User-Agent": f"PipoLauncher/{VERSION}"})
+    h = hashlib.sha256()
+    hecho = 0
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r, open(parcial, "wb") as f:
+            total = int(r.headers.get("Content-Length") or info.get("size") or 0)
+            while True:
+                if cancelar.is_set():
+                    raise InterruptedError()
+                bloque = r.read(65536)
+                if not bloque:
+                    break
+                f.write(bloque)
+                h.update(bloque)
+                hecho += len(bloque)
+                progreso(hecho, total)
+        if total and hecho != total:
+            raise OSError("La descarga quedó incompleta.")
+        if info.get("sha256") and h.hexdigest().lower() != info["sha256"]:
+            raise OSError("El archivo descargado no coincide con el publicado (SHA-256).")
+        with open(parcial, "rb") as f:
+            if f.read(2) != b"MZ":
+                raise OSError("El archivo descargado no es un ejecutable válido.")
+        os.replace(parcial, nuevo)
+    except BaseException:
+        try:
+            os.remove(parcial)
+        except OSError:
+            pass
+        raise
+    return nuevo
+
+def aplicar_actualizacion(nuevo):
+    """Un .exe no puede pisarse mientras corre: se lanza un .bat que espera a que el launcher cierre, reemplaza
+    el .exe y lo vuelve a abrir. Después de llamar a esto hay que cerrar el launcher."""
+    viejo = sys.executable
+    bat = os.path.join(carpeta_pipolauncher, "actualizar.bat")
+    esc = lambda p: p.replace("%", "%%")
+    script = (
+        "@echo off\r\nchcp 65001 >nul\r\n"
+        f'set "VIEJO={esc(viejo)}"\r\nset "NUEVO={esc(nuevo)}"\r\n'
+        "for /l %%i in (1,1,90) do (\r\n"
+        '  move /y "%NUEVO%" "%VIEJO%" >nul 2>&1\r\n'
+        '  if not exist "%NUEVO%" goto listo\r\n'
+        "  ping -n 2 127.0.0.1 >nul\r\n"   # 'timeout' falla con la entrada redirigida
+        ")\r\nexit /b 1\r\n"
+        ':listo\r\nstart "" "%VIEJO%"\r\n'
+        '(goto) 2>nul & del "%~f0"\r\n'
+    )
+    with open(bat, "w", encoding="utf-8", newline="") as f:
+        f.write(script)
+    # El .exe nuevo no debe heredar las variables internas de PyInstaller del proceso viejo (apuntan a una
+    # carpeta temporal que se borra al cerrar): sin esto, a veces arranca roto.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("_PYI") and k != "_MEIPASS2"}
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    subprocess.Popen(["cmd.exe", "/c", bat], env=env, close_fds=True,
+                     creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
+                     | subprocess.CREATE_NEW_PROCESS_GROUP,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 # ---------------------------------------------------------------------------
 # INSTALADOR / ACTUALIZADOR (.minecraft: versiones, librerías, assets y Java)
@@ -1861,6 +1983,147 @@ def main():
             btn_cancelar.configure(state="disabled", text="…")
             inst.cancelar()
     ventana.protocol("WM_DELETE_WINDOW", al_cerrar)
+
+    # ----- aviso de actualización del launcher -----
+    def mostrar_actualizacion(info):
+        top = tk.Toplevel(ventana)
+        top.title("Actualización disponible")
+        top.configure(bg="#142016")
+        top.resizable(False, False)
+        try:
+            top.iconbitmap(ruta_recurso("icono.ico"))
+        except Exception:
+            pass
+        AW, AH = 460, 430
+        top.geometry(f"{AW}x{AH}+{ventana.winfo_x() + (W - AW) // 2}+{ventana.winfo_y() + (H - AH) // 2}")
+        top.transient(ventana)
+        cv = tk.Canvas(top, width=AW, height=AH, highlightthickness=0, bg="#142016")
+        cv.pack()
+        cv.create_rectangle(0, 0, AW, 4, fill=C_VERDE, outline=C_VERDE)
+        cv.create_text(AW // 2, 40, text="ACTUALIZACIÓN DISPONIBLE", font=("Segoe UI", 15, "bold"), fill="white")
+        cv.create_text(AW // 2, 72, text=f"v{VERSION}   →   {info['tag']}", font=("Segoe UI", 12, "bold"),
+                       fill=C_VERDE)
+        cv.create_text(AW // 2, 100, text="Hay una nueva versión de PipoLauncher.", font=("Segoe UI", 9),
+                       fill=C_GRIS)
+
+        caja = tk.Text(cv, font=("Segoe UI", 9), bg=C_CAMPO, fg="white", relief="flat", wrap="word",
+                       highlightthickness=1, highlightbackground=C_BORDE, padx=10, pady=8, cursor="arrow")
+        caja.insert("1.0", "Novedades:\n" + (info["notas"] or "Sin notas para esta versión."))
+        caja.configure(state="disabled")
+        cv.create_window(AW // 2, 192, window=caja, width=400, height=134)
+
+        msg = cv.create_text(AW // 2, 286, text="", font=("Segoe UI", 9, "bold"), fill=C_GRIS, width=400)
+        barra = ttk.Progressbar(cv, style="Pipo.Horizontal.TProgressbar", mode="determinate", maximum=100)
+        id_barra = cv.create_window(AW // 2, 312, window=barra, width=400, height=14, state="hidden")
+
+        auto = puede_autoactualizar(info)
+        d = {"ocupado": False, "cancelar": threading.Event(), "p": {"hecho": 0, "total": 0, "fin": False,
+                                                                     "error": None, "ruta": None}}
+
+        def cerrar():
+            try:
+                top.grab_release()
+            except tk.TclError:
+                pass
+            top.destroy()
+
+        def mas_tarde():
+            if d["ocupado"]:  # descargando: el botón pasa a ser «Cancelar»
+                d["cancelar"].set()
+                btn_tarde.configure(state="disabled", text="Cancelando…")
+            else:
+                cerrar()
+
+        def volver_a_inicio(texto_msg="", color=C_GRIS):
+            d["ocupado"] = False
+            cv.itemconfigure(id_barra, state="hidden")
+            cv.itemconfigure(msg, text=texto_msg, fill=color)
+            btn_act.configure(state="normal")
+            btn_tarde.configure(state="normal", text="Quizás más tarde")
+
+        def sondear():
+            if not top.winfo_exists():
+                return
+            p = d["p"]
+            if p["total"]:
+                barra["value"] = p["hecho"] * 100 / p["total"]
+                cv.itemconfigure(msg, text=f"Descargando… {p['hecho'] / 1048576:.1f} / "
+                                           f"{p['total'] / 1048576:.1f} MB", fill=C_GRIS)
+            if not p["fin"]:
+                top.after(100, sondear)
+                return
+            if p["error"] == "cancelado":
+                volver_a_inicio("Descarga cancelada.")
+            elif p["error"]:
+                volver_a_inicio("No se pudo actualizar: " + p["error"], "#e07070")
+                btn_act.configure(text="REINTENTAR")
+            else:
+                cv.itemconfigure(msg, text="Instalando… el launcher se va a reiniciar solo.", fill=C_VERDE)
+                try:
+                    aplicar_actualizacion(p["ruta"])
+                except Exception as e:
+                    volver_a_inicio(f"No se pudo instalar: {e}", "#e07070")
+                    btn_act.configure(text="REINTENTAR")
+                    return
+                top.after(400, ventana.destroy)
+
+        def trabajo():
+            p = d["p"]
+            try:
+                p["ruta"] = descargar_actualizacion(info, lambda h, t: p.update(hecho=h, total=t), d["cancelar"])
+            except InterruptedError:
+                p["error"] = "cancelado"
+            except Exception as e:
+                p["error"] = str(e) or e.__class__.__name__
+            p["fin"] = True
+
+        def actualizar():
+            if not auto:  # .py, carpeta sin permiso o release sin .exe: se abre la página de descarga
+                webbrowser.open(info["pagina"])
+                cerrar()
+                return
+            if estado["inst"] is not None:
+                messagebox.showwarning("Descarga en curso", "Hay una descarga del juego en curso.\n"
+                                       "Esperá a que termine para actualizar el launcher.", parent=top)
+                return
+            d["ocupado"] = True
+            d["cancelar"].clear()
+            d["p"].update(hecho=0, total=0, fin=False, error=None, ruta=None)
+            btn_act.configure(state="disabled")
+            btn_tarde.configure(text="Cancelar")
+            barra["value"] = 0
+            cv.itemconfigure(id_barra, state="normal")
+            cv.itemconfigure(msg, text="Conectando…", fill=C_GRIS)
+            threading.Thread(target=trabajo, daemon=True).start()
+            sondear()
+
+        btn_act = boton(cv, "ACTUALIZAR AHORA" if auto else "ABRIR DESCARGA", C_VERDE, C_VERDE_H,
+                        ("Segoe UI", 12, "bold"), actualizar, fg="#0c1a0c")
+        cv.create_window(AW // 2, 358, width=260, height=40, window=btn_act)
+        btn_tarde = boton(cv, "Quizás más tarde", "#2a3d2a", "#3a5a3a", ("Segoe UI", 10), mas_tarde)
+        cv.create_window(AW // 2, 404, width=260, height=30, window=btn_tarde)
+        top.protocol("WM_DELETE_WINDOW", mas_tarde)
+        try:
+            top.grab_set()
+        except tk.TclError:
+            pass
+        top.focus_force()
+
+    # Se busca en segundo plano (no demora el arranque) y el aviso aparece apenas llega la respuesta
+    hallazgo = {"info": None, "listo": False}
+
+    def revisar_actualizacion():
+        hallazgo["info"] = buscar_actualizacion()
+        hallazgo["listo"] = True
+
+    def esperar_actualizacion():
+        if not hallazgo["listo"]:
+            ventana.after(300, esperar_actualizacion)
+        elif hallazgo["info"]:
+            mostrar_actualizacion(hallazgo["info"])
+
+    threading.Thread(target=revisar_actualizacion, daemon=True).start()
+    ventana.after(300, esperar_actualizacion)
 
     refrescar_lista()
     if not cfg["instalado"] or not cfg["java_local"]:  # 2º caso: instalaciones anteriores sin revisar el Java de la PC
