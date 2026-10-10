@@ -59,8 +59,8 @@ RESERVA_PORC = 0.25
 
 # Enlace que se abre (en el navegador por defecto) al tocar el logo y el título de la ventana principal
 URL_CANAL = "https://www.youtube.com/@UncleJuan67"
-# Documento de INFORMACIÓN GENERAL del launcher (botón ⓘ de la ventana principal)
-URL_INFO = "https://docs.google.com/document/d/15ZFAZeOLnyqWE65hsw_oNzN-XbaXkS0q/edit?usp=sharing"
+# Repositorio de GitHub con la INFORMACIÓN del launcher (botón ⓘ de la ventana principal)
+URL_INFO = "https://github.com/Mendez-afk/PipoLauncher"
 
 # Servidores de Mojang y ajustes del instalador
 URL_MANIFIESTO = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
@@ -71,7 +71,7 @@ URL_ADOPTIUM = "https://api.adoptium.net/v3"   # Eclipse Temurin: Java para inst
 # Actualizaciones del propio launcher (GitHub Releases).
 # IMPORTANTE: subí VERSION en cada release, antes de compilar el .exe, y que coincida con el tag de la release
 # (ej. VERSION = "1.1.0"  ->  tag "v1.1.0"). Si no coinciden, el launcher se ofrecería actualizar a sí mismo en bucle.
-VERSION = "1.1.2"
+VERSION = "0.1.1.3"
 GITHUB_REPO = "Mendez-afk/PipoLauncher"
 ASSET_EXE = "PipoLauncher.exe"   # nombre del .exe que se sube como archivo de la release
 URL_RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -1561,7 +1561,7 @@ def main():
                         highlightthickness=1, highlightbackground=C_BORDE)
     btn_cfg.place(x=W - 18, y=18, anchor="ne", width=40, height=40)
 
-    # Botón de información (a la izquierda del engranaje): abre el documento de INFORMACIÓN GENERAL
+    # Botón de información (a la izquierda del engranaje): abre el repositorio de GitHub
     btn_info = tk.Button(ventana, text="\u2139", font=("Segoe UI Symbol", 15, "bold"), bg=C_CAMPO, fg="white",
                          activebackground="#2d4a2d", activeforeground="white", relief="flat", bd=0,
                          cursor="hand2", command=lambda: abrir_url(URL_INFO),
