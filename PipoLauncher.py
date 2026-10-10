@@ -74,7 +74,8 @@ URL_ADOPTIUM = "https://api.adoptium.net/v3"   # Eclipse Temurin: Java para inst
 VERSION = "0.1.1.3"
 GITHUB_REPO = "Mendez-afk/PipoLauncher"
 ASSET_EXE = "PipoLauncher.exe"   # nombre del .exe que se sube como archivo de la release
-URL_RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+# Se lee la LISTA de releases (no /releases/latest, que ignora las pre-releases) y se toma la de versión más alta
+URL_RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=30"
 URL_RELEASES_WEB = f"https://github.com/{GITHUB_REPO}/releases/latest"
 PLATAFORMA_JAVA = "windows-x64"   # carpeta que usa Mojang para los runtimes de Java en Windows 64 bits
 HILOS_DESCARGA = 16               # descargas simultáneas
@@ -486,24 +487,39 @@ def limpiar_notas(md, maximo=700):
     t = re.sub(r"\n{3,}", "\n\n", t).strip()
     return t if len(t) <= maximo else t[:maximo].rstrip() + "…"
 
-def buscar_actualizacion(timeout=8):
-    """Consulta la última release publicada. Devuelve un dict si es MÁS NUEVA que VERSION, si no None.
+def buscar_actualizacion(timeout=6):
+    """Revisa el repositorio: entre TODAS las releases publicadas (pre-releases incluidas, borradores no) toma la
+    de versión más alta y devuelve un dict si es MÁS NUEVA que VERSION, si no None.
     Cualquier fallo (sin internet, límite de la API, JSON raro) se ignora: el launcher abre igual."""
-    req = urllib.request.Request(URL_RELEASES_API, headers={
-        "User-Agent": f"PipoLauncher/{VERSION}", "Accept": "application/vnd.github+json"})
+    # el parámetro t evita que GitHub/proxies sirvan una copia guardada de hace un rato
+    req = urllib.request.Request(f"{URL_RELEASES_API}&t={int(time.time())}", headers={
+        "User-Agent": f"PipoLauncher/{VERSION}", "Accept": "application/vnd.github+json",
+        "Cache-Control": "no-cache"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            rel = json.loads(r.read().decode("utf-8"))
-        if not isinstance(rel, dict) or rel.get("draft") or rel.get("prerelease"):
+            lista = json.loads(r.read().decode("utf-8"))
+        if not isinstance(lista, list):
             return None
-        tag = str(rel.get("tag_name") or "")
-        if not re.search(r"\d", tag) or version_a_tupla(tag) <= version_a_tupla(VERSION):
+        mejor = None
+        for r_ in lista:
+            if not isinstance(r_, dict) or r_.get("draft"):
+                continue
+            tag_ = str(r_.get("tag_name") or "")
+            if not re.search(r"\d", tag_):
+                continue
+            v = version_a_tupla(tag_)
+            if mejor is None or v > mejor[0]:
+                mejor = (v, r_)
+        if mejor is None or mejor[0] <= version_a_tupla(VERSION):
             return None
+        rel = mejor[1]
+        tag = str(rel.get("tag_name"))
         asset = next((a for a in rel.get("assets") or []
                       if str(a.get("name", "")).lower() == ASSET_EXE.lower()), None)
         digest = str((asset or {}).get("digest") or "").lower()
         return {
             "tag": tag,
+            "pre": bool(rel.get("prerelease")),
             "titulo": str(rel.get("name") or tag),
             "notas": limpiar_notas(rel.get("body")),
             "pagina": str(rel.get("html_url") or URL_RELEASES_WEB),
@@ -580,9 +596,13 @@ def aplicar_actualizacion(nuevo):
     # carpeta temporal que se borra al cerrar): sin esto, a veces arranca roto.
     env = {k: v for k, v in os.environ.items() if not k.startswith("_PYI") and k != "_MEIPASS2"}
     env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
-    subprocess.Popen(["cmd.exe", "/c", bat], env=env, close_fds=True,
-                     creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
-                     | subprocess.CREATE_NEW_PROCESS_GROUP,
+    # Ventana oculta: CREATE_NO_WINDOW se ignora si se combina con DETACHED_PROCESS (cmd abría una consola visible),
+    # así que se usa solo y, por las dudas, también SW_HIDE.
+    oculto = subprocess.STARTUPINFO()
+    oculto.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    oculto.wShowWindow = 0  # SW_HIDE
+    subprocess.Popen(["cmd.exe", "/c", bat], env=env, close_fds=True, startupinfo=oculto,
+                     creationflags=subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP,
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 # ---------------------------------------------------------------------------
@@ -1403,6 +1423,7 @@ def main():
     cfg["ram"] = max(1, min(cfg["ram"], ram_max))  # por si el tope cambió desde la última vez
 
     ventana = tk.Tk()
+    ventana.withdraw()  # oculta hasta terminar de revisar actualizaciones (ver el final de main)
     ventana.title("PipoLauncher")
     W, H, BARRA = 800, 450, 86
     x = (ventana.winfo_screenwidth() // 2) - (W // 2)
@@ -1985,7 +2006,8 @@ def main():
     ventana.protocol("WM_DELETE_WINDOW", al_cerrar)
 
     # ----- aviso de actualización del launcher -----
-    def mostrar_actualizacion(info):
+    def mostrar_actualizacion(info, al_terminar=None):
+        """Ventana de actualización. 'al_terminar' se llama cuando se cierra SIN actualizar (más tarde)."""
         top = tk.Toplevel(ventana)
         top.title("Actualización disponible")
         top.configure(bg="#142016")
@@ -2001,8 +2023,8 @@ def main():
         cv.pack()
         cv.create_rectangle(0, 0, AW, 4, fill=C_VERDE, outline=C_VERDE)
         cv.create_text(AW // 2, 40, text="ACTUALIZACIÓN DISPONIBLE", font=("Segoe UI", 15, "bold"), fill="white")
-        cv.create_text(AW // 2, 72, text=f"v{VERSION}   →   {info['tag']}", font=("Segoe UI", 12, "bold"),
-                       fill=C_VERDE)
+        cv.create_text(AW // 2, 72, text=f"v{VERSION}   →   {info['tag']}" + ("  (pre-release)" if info.get("pre") else ""),
+                       font=("Segoe UI", 12, "bold"), fill=C_VERDE)
         cv.create_text(AW // 2, 100, text="Hay una nueva versión de PipoLauncher.", font=("Segoe UI", 9),
                        fill=C_GRIS)
 
@@ -2026,6 +2048,8 @@ def main():
             except tk.TclError:
                 pass
             top.destroy()
+            if al_terminar:
+                al_terminar()
 
         def mas_tarde():
             if d["ocupado"]:  # descargando: el botón pasa a ser «Cancelar»
@@ -2109,27 +2133,56 @@ def main():
             pass
         top.focus_force()
 
-    # Se busca en segundo plano (no demora el arranque) y el aviso aparece apenas llega la respuesta
+    def arrancar():
+        """Lo que antes corría al abrir: ahora va DESPUÉS de revisar (y, si corresponde, ofrecer) la actualización."""
+        refrescar_lista()
+        if not cfg["instalado"] or not cfg["java_local"]:  # 2º caso: instalaciones sin revisar el Java de la PC
+            ventana.after(300, preparar)
+        else:
+            refrescar_en_segundo_plano()
+
+    # ----- arranque: antes de mostrar el launcher se revisa el repositorio -----
+    # Mientras tanto solo se ve una ventanita «Buscando actualizaciones…». Si hay una versión más nueva se muestra
+    # el aviso de actualización (Actualizar ahora / Quizás más tarde) y recién después se habilita el launcher.
+    splash = tk.Toplevel(ventana)
+    splash.overrideredirect(True)
+    splash.configure(bg=C_BORDE)
+    SW, SH = 360, 120
+    splash.geometry(f"{SW}x{SH}+{(ventana.winfo_screenwidth() - SW) // 2}+{(ventana.winfo_screenheight() - SH) // 2}")
+    interior = tk.Frame(splash, bg="#142016")
+    interior.pack(fill="both", expand=True, padx=2, pady=2)
+    tk.Label(interior, text="PIPO LAUNCHER", font=("Segoe UI", 14, "bold"), bg="#142016", fg="white").pack(pady=(18, 0))
+    tk.Label(interior, text="Buscando actualizaciones…", font=("Segoe UI", 10), bg="#142016",
+             fg=C_GRIS).pack(pady=(2, 8))
+    barra_splash = ttk.Progressbar(interior, style="Pipo.Horizontal.TProgressbar", mode="indeterminate", length=280)
+    barra_splash.pack()
+    barra_splash.start(12)
+    splash.attributes("-topmost", True)
+    splash.lift()
+
     hallazgo = {"info": None, "listo": False}
 
     def revisar_actualizacion():
-        hallazgo["info"] = buscar_actualizacion()
-        hallazgo["listo"] = True
+        try:
+            hallazgo["info"] = buscar_actualizacion()
+        finally:
+            hallazgo["listo"] = True
 
-    def esperar_actualizacion():
+    def terminar_revision():
         if not hallazgo["listo"]:
-            ventana.after(300, esperar_actualizacion)
-        elif hallazgo["info"]:
-            mostrar_actualizacion(hallazgo["info"])
+            ventana.after(100, terminar_revision)
+            return
+        barra_splash.stop()
+        splash.destroy()
+        ventana.deiconify()
+        ventana.update_idletasks()
+        if hallazgo["info"]:
+            mostrar_actualizacion(hallazgo["info"], arrancar)
+        else:
+            arrancar()
 
     threading.Thread(target=revisar_actualizacion, daemon=True).start()
-    ventana.after(300, esperar_actualizacion)
-
-    refrescar_lista()
-    if not cfg["instalado"] or not cfg["java_local"]:  # 2º caso: instalaciones anteriores sin revisar el Java de la PC
-        ventana.after(300, preparar)
-    else:
-        refrescar_en_segundo_plano()
+    ventana.after(100, terminar_revision)
 
     ventana.mainloop()
 
