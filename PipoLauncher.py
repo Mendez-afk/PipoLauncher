@@ -51,6 +51,7 @@ ruta_latest = os.path.join(carpeta_logs, "latest.log")
 ruta_manifiesto = os.path.join(carpeta_pipolauncher, "version_manifest.json")  # copia local para uso sin internet
 ruta_profiles = os.path.join(carpeta_minecraft, "launcher_profiles.json")      # lo exigen Forge, Fabric, NeoForge...
 carpeta_java_local = os.path.join(carpeta_pipolauncher, "java")                # Java para la PC (instaladores de mods)
+carpeta_perfiles = os.path.join(carpeta_pipolauncher, "profiles")              # un perfil (carpeta de juego) por versión
 
 # Memoria que se deja libre para Windows: lo mayor entre RESERVA_MIN_GB y RESERVA_PORC del total.
 # Ej: 8 GB -> máx 6 | 16 GB -> máx 12 | 32 GB -> máx 24 | 4 GB -> máx 2
@@ -96,7 +97,8 @@ TIPOS_VANILLA = ("release",)
 # CONFIGURACIÓN (usuario, RAM, última versión elegida, logs)
 # ---------------------------------------------------------------------------
 def cargar_config():
-    cfg = {"usuario": "Invitado", "ram": 4, "version": "", "logs": True, "instalado": False, "java_local": False}
+    cfg = {"usuario": "Invitado", "ram": 4, "version": "", "logs": True, "instalado": False, "java_local": False,
+           "perfiles": True}
     if os.path.exists(ruta_config):
         try:
             with open(ruta_config, "r", encoding="utf-8") as f:
@@ -122,12 +124,181 @@ def cargar_config():
     cfg["logs"] = bool(cfg.get("logs", True))
     cfg["instalado"] = bool(cfg.get("instalado", False))
     cfg["java_local"] = bool(cfg.get("java_local", False))
+    cfg["perfiles"] = bool(cfg.get("perfiles", True))
     return cfg
 
 def guardar_config(cfg):
     os.makedirs(carpeta_pipolauncher, exist_ok=True)
     with open(ruta_config, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
+
+# ---------------------------------------------------------------------------
+# PERFILES POR VERSIÓN
+# Cada versión tiene su propia carpeta de juego (el --gameDir de Minecraft):
+#   .minecraft\Pipolauncher\profiles\<versión>\game\          options.txt, servers.dat, mods\, config\, saves\,
+#                                                             resourcepacks\, shaderpacks\, screenshots\, logs\ ...
+#   .minecraft\Pipolauncher\profiles\<versión>\profile.json   metadatos del perfil
+# Así los mods, la configuración y los mundos de una versión (o de un loader) no se mezclan con los de otra.
+# Lo pesado y común sigue compartido en .minecraft: versions, libraries, assets, runtime y natives.
+# ---------------------------------------------------------------------------
+PERFIL_SCHEMA = 1
+# Se copian de .minecraft al crear un perfil: datos personales que sirven en cualquier versión. Los mods y la
+# config de mods NO se copian (son de un loader/versión concretos y podrían romper otra) y los mundos se preguntan.
+IMPORTAR_AL_CREAR = ("options.txt", "optionsof.txt", "servers.dat", "resourcepacks")
+LIMITE_IMPORTAR_MB = 300
+
+def ahora_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+def nombre_carpeta_perfil(vid):
+    """El id de versión como nombre de carpeta válido en Windows."""
+    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(vid)).strip(" .") or "perfil"
+
+def ruta_perfil(vid):
+    return os.path.join(carpeta_perfiles, nombre_carpeta_perfil(vid))
+
+def leer_json_dict(ruta):
+    try:
+        with open(ruta, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else None
+    except (OSError, ValueError):
+        return None
+
+def guardar_json_atomico(ruta, datos):
+    """Escribe a un temporal y lo mueve: un corte de luz a mitad no deja el JSON a medias."""
+    tmp = ruta + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(datos, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, ruta)
+
+def tam_bytes(ruta, tope=None):
+    """Tamaño de un archivo o carpeta; con 'tope' deja de contar al pasarlo (no recorre carpetas enormes)."""
+    if os.path.isfile(ruta):
+        return os.path.getsize(ruta)
+    total = 0
+    for base, _dirs, archivos in os.walk(ruta):
+        for a in archivos:
+            try:
+                total += os.path.getsize(os.path.join(base, a))
+            except OSError:
+                pass
+            if tope and total > tope:
+                return total
+    return total
+
+def copiar_seguro(origen, destino):
+    """Copia un archivo o carpeta SIN tocar el original; si falla a medias, no deja restos."""
+    try:
+        if os.path.isdir(origen):
+            shutil.copytree(origen, destino)
+        else:
+            os.makedirs(os.path.dirname(destino), exist_ok=True)
+            shutil.copy2(origen, destino)
+        return True
+    except (OSError, shutil.Error):
+        if os.path.isdir(destino):
+            shutil.rmtree(destino, ignore_errors=True)
+        elif os.path.exists(destino):
+            try:
+                os.remove(destino)
+            except OSError:
+                pass
+        return False
+
+def importar_datos_existentes(juego):
+    """Copia al perfil nuevo las opciones, servidores y resource packs que ya había en .minecraft.
+    Devuelve (copiados, omitidos); lo que ya exista en el perfil no se pisa."""
+    copiados, omitidos = [], []
+    tope = LIMITE_IMPORTAR_MB * 1048576
+    for nombre in IMPORTAR_AL_CREAR:
+        origen, destino = os.path.join(carpeta_minecraft, nombre), os.path.join(juego, nombre)
+        if not os.path.exists(origen) or os.path.exists(destino):
+            continue
+        if tam_bytes(origen, tope) > tope or not copiar_seguro(origen, destino):
+            omitidos.append(nombre)
+        else:
+            copiados.append(nombre)
+    return copiados, omitidos
+
+def mundos_existentes():
+    """(ruta, MB) de los mundos guardados en .minecraft\\saves, o None si no hay ninguno."""
+    ruta = os.path.join(carpeta_minecraft, "saves")
+    try:
+        if not os.listdir(ruta):
+            return None
+    except OSError:
+        return None
+    return ruta, tam_bytes(ruta) / 1048576
+
+def es_version_legacy(vid):
+    """Versiones anteriores a 1.6 (índice de assets 'pre-1.6'): leen sus sonidos de <gameDir>\\resources, que el
+    instalador deja en .minecraft. Para ellas no se separa la carpeta de juego."""
+    try:
+        data = cargar_version(vid)
+        return ((data.get("assetIndex") or {}).get("id") or data.get("assets")) == "pre-1.6"
+    except Exception:
+        return False
+
+def asegurar_perfil(vid):
+    """Crea (si falta) y devuelve el perfil de una versión: (datos del profile.json, carpeta de juego, es_nuevo).
+    Es idempotente y tolera un profile.json dañado (lo respalda como .bak y lo regenera sin perder el juego)."""
+    raiz = ruta_perfil(vid)
+    juego = os.path.join(raiz, "game")
+    ruta_json = os.path.join(raiz, "profile.json")
+    os.makedirs(juego, exist_ok=True)
+    nuevo = not os.path.exists(ruta_json)
+    datos = leer_json_dict(ruta_json)
+    if datos is None:
+        if not nuevo:
+            try:
+                os.replace(ruta_json, ruta_json + ".bak")
+            except OSError:
+                pass
+        datos = {}
+    base = {"schema": PERFIL_SCHEMA, "version": vid, "creado": ahora_iso(), "ultimo_uso": None,
+            "veces_jugado": 0, "importado": [], "omitidos": [], "mundos": None}
+    cambio = nuevo
+    for clave, valor in base.items():
+        if clave not in datos:
+            datos[clave] = valor
+            cambio = True
+    if nuevo:
+        datos["importado"], datos["omitidos"] = importar_datos_existentes(juego)
+    for sub in ("mods", "resourcepacks", "saves"):  # carpetas que el jugador va a querer encontrar
+        os.makedirs(os.path.join(juego, sub), exist_ok=True)
+    if cambio:
+        guardar_json_atomico(ruta_json, datos)
+    return datos, juego, nuevo
+
+def actualizar_perfil(vid, **cambios):
+    """Cambia campos del profile.json de un perfil existente."""
+    ruta_json = os.path.join(ruta_perfil(vid), "profile.json")
+    datos = leer_json_dict(ruta_json)
+    if datos is None:
+        return
+    datos.update(cambios)
+    guardar_json_atomico(ruta_json, datos)
+
+def registrar_uso(vid):
+    """Anota que el perfil se acaba de jugar (fecha y contador)."""
+    datos = leer_json_dict(os.path.join(ruta_perfil(vid), "profile.json"))
+    if datos is not None:
+        actualizar_perfil(vid, ultimo_uso=ahora_iso(), veces_jugado=int(datos.get("veces_jugado") or 0) + 1)
+
+def importar_mundos(juego):
+    """Copia .minecraft\\saves al perfil (los originales quedan intactos). Devuelve True si salió bien."""
+    origen, destino = os.path.join(carpeta_minecraft, "saves"), os.path.join(juego, "saves")
+    try:
+        os.makedirs(destino, exist_ok=True)
+        for nombre in os.listdir(origen):
+            if os.path.exists(os.path.join(destino, nombre)):
+                continue
+            if not copiar_seguro(os.path.join(origen, nombre), os.path.join(destino, nombre)):
+                return False
+        return True
+    except OSError:
+        return False
 
 def uuid_offline(nombre):
     """UUID de modo offline: el mismo algoritmo que usan los servidores offline
@@ -360,7 +531,8 @@ def buscar_java(data):
             return c
     raise JavaNoEncontrado(comp, mayor, candidatos)
 
-def construir_comando(vid, usuario, ram, uuid_jugador, con_logs=False):
+def construir_comando(vid, usuario, ram, uuid_jugador, con_logs=False, dir_juego=None):
+    """dir_juego: carpeta de juego del perfil (--gameDir). Sin ella se usa .minecraft como antes."""
     data = cargar_version(vid)
     java = buscar_java(data)
 
@@ -408,7 +580,7 @@ def construir_comando(vid, usuario, ram, uuid_jugador, con_logs=False):
 
     sep = ";"
     variables = {
-        "auth_player_name": usuario, "version_name": vid, "game_directory": carpeta_minecraft,
+        "auth_player_name": usuario, "version_name": vid, "game_directory": dir_juego or carpeta_minecraft,
         "assets_root": carpeta_assets,
         "assets_index_name": (data.get("assetIndex") or {}).get("id") or data.get("assets", "legacy"),
         "auth_uuid": uuid_jugador, "auth_access_token": "0", "auth_session": "0",
@@ -445,9 +617,10 @@ def construir_comando(vid, usuario, ram, uuid_jugador, con_logs=False):
     juego = limpiar([sustituir(a, variables) for a in juego])
     return [java] + memoria + jvm + [data["mainClass"]] + juego, faltan
 
-def iniciar(cmd, registro=None):
+def iniciar(cmd, registro=None, cwd=None):
     """Sin logs: lanza el juego y se olvida de él. Con logs: captura su salida hacia el registro.
-    Devuelve (proceso, hilo_lector)."""
+    'cwd' es la carpeta de juego del perfil (por defecto .minecraft). Devuelve (proceso, hilo_lector)."""
+    cwd = cwd or carpeta_minecraft
     if len(subprocess.list2cmdline(cmd)) > 30000:  # límite de Windows ~32k: usar @argfile
         os.makedirs(carpeta_pipolauncher, exist_ok=True)
         with open(ruta_args, "w", encoding="utf-8") as f:
@@ -458,11 +631,11 @@ def iniciar(cmd, registro=None):
     nt = os.name == "nt"
     if registro is None:
         flags = (subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP) if nt else 0
-        proc = subprocess.Popen(cmd, cwd=carpeta_minecraft, creationflags=flags, close_fds=True,
+        proc = subprocess.Popen(cmd, cwd=cwd, creationflags=flags, close_fds=True,
                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return proc, None
     flags = (subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP) if nt else 0
-    proc = subprocess.Popen(cmd, cwd=carpeta_minecraft, creationflags=flags, close_fds=True,
+    proc = subprocess.Popen(cmd, cwd=cwd, creationflags=flags, close_fds=True,
                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             encoding="utf-8", errors="replace")
 
@@ -1777,8 +1950,49 @@ def main():
             log(f"PipoLauncher | Windows {platform.version()} | Python {platform.python_version()}")
             log(f"Usuario: {usuario} | UUID: {uuid_jugador} | Versión: {vid} | RAM: {ram} GB "
                 f"(PC: {total_ram} GB, máximo permitido: {ram_max} GB)")
+            # Perfil de la versión: su propia carpeta de juego (mods, config, mundos, opciones...)
+            dir_juego = None
+            if cfg["perfiles"]:
+                try:
+                    if es_version_legacy(vid):
+                        log("Versión anterior a 1.6: usa .minecraft directamente (sus sonidos están en .minecraft\\resources)")
+                    else:
+                        perfil, dir_juego, nuevo = asegurar_perfil(vid)
+                        if nuevo:
+                            log(f"Perfil creado: {dir_juego} | importado: {', '.join(perfil['importado']) or '-'}"
+                                + (f" | omitido por tamaño o error: {', '.join(perfil['omitidos'])}"
+                                   if perfil["omitidos"] else ""))
+                            hay = mundos_existentes()
+                            if hay:
+                                if messagebox.askyesno(
+                                        f"Perfil de {vid}",
+                                        f"Se creó un perfil independiente para {vid}.\n\n"
+                                        f"Encontramos mundos guardados en .minecraft\\saves ({hay[1]:.0f} MB).\n"
+                                        "¿Copiarlos a este perfil?\n\n"
+                                        "• Sí: se copian (los originales no se tocan).\n"
+                                        "• No: el perfil empieza sin mundos; podés copiarlos después desde "
+                                        "Configuración → «Abrir carpeta del perfil»."):
+                                    ventana.configure(cursor="watch")
+                                    ventana.update()
+                                    ok = importar_mundos(dir_juego)
+                                    ventana.configure(cursor="")
+                                    actualizar_perfil(vid, mundos=ok)
+                                    log("Mundos copiados al perfil" if ok else "No se pudieron copiar todos los mundos",
+                                        "INFO" if ok else "WARN")
+                                    if not ok:
+                                        messagebox.showwarning(
+                                            "Mundos", "No se pudieron copiar todos los mundos.\nSiguen intactos en "
+                                                      ".minecraft\\saves; podés copiarlos a mano a la carpeta del perfil.")
+                                else:
+                                    actualizar_perfil(vid, mundos=False)
+                        else:
+                            log(f"Perfil: {dir_juego}")
+                except OSError as e:
+                    dir_juego = None
+                    log(f"No se pudo preparar el perfil ({e}); se usa .minecraft", "WARN")
             try:
-                cmd, faltan = construir_comando(vid, usuario, ram, uuid_jugador, con_logs=registro is not None)
+                cmd, faltan = construir_comando(vid, usuario, ram, uuid_jugador, con_logs=registro is not None,
+                                                dir_juego=dir_juego)
             except JavaNoEncontrado as e:
                 log(str(e), "WARN")
                 if not reparado:
@@ -1813,8 +2027,13 @@ def main():
                     cerrar_log()
                     return
             log("Comando: " + subprocess.list2cmdline(cmd))
-            proc, hilo = iniciar(cmd, registro)
+            proc, hilo = iniciar(cmd, registro, cwd=dir_juego)
             log("Minecraft iniciado")
+            if dir_juego:
+                try:
+                    registrar_uso(vid)
+                except OSError:
+                    pass
         except Exception as e:
             log(traceback.format_exc(), "ERROR")
             cerrar_log()
@@ -1922,30 +2141,37 @@ def main():
     # ----- configuración (en la misma ventana, encima de la principal) -----
     panel_cfg = tk.Canvas(ventana, width=W, height=H, highlightthickness=0, bg="#0c160c")
     panel_cfg.create_image(0, 0, image=ventana.fondo_config, anchor="nw")
-    CX1, CX2, CY1, CY2 = 220, 580, 66, 394
+    CX1, CX2, CY1, CY2 = 220, 580, 44, 420
     panel_cfg.create_rectangle(CX1, CY1, CX2, CY2, fill="#142016", outline=C_BORDE, width=2)
     panel_cfg.create_rectangle(CX1, CY1, CX2, CY1 + 4, fill=C_VERDE, outline=C_VERDE)
     var_ram = tk.StringVar()
     var_logs = tk.BooleanVar()
+    var_perfiles = tk.BooleanVar()
     en_config = [False]
 
     def texto_p(yy, s, fuente, color="white"):
         panel_cfg.create_text(W // 2, yy, text=s, font=fuente, fill=color)
 
-    texto_p(96, "CONFIGURACIÓN", ("Segoe UI", 14, "bold"))
-    texto_p(138, "Memoria RAM (GB)", ("Segoe UI", 10, "bold"), C_GRIS)
+    texto_p(74, "CONFIGURACIÓN", ("Segoe UI", 14, "bold"))
+    texto_p(108, "Memoria RAM (GB)", ("Segoe UI", 10, "bold"), C_GRIS)
     spin = tk.Spinbox(panel_cfg, from_=1, to=ram_max, textvariable=var_ram, font=("Segoe UI", 13),
                       justify="center", bg=C_CAMPO, fg="white", insertbackground="white",
                       buttonbackground="#2d4a2d", relief="flat", highlightthickness=1,
                       highlightbackground=C_BORDE, highlightcolor=C_VERDE)
-    panel_cfg.create_window(W // 2, 170, window=spin, width=90, height=32)
-    texto_p(203, f"Tu PC tiene {total_ram} GB · máximo permitido: {ram_max} GB", ("Segoe UI", 8), "#6f826f")
+    panel_cfg.create_window(W // 2, 136, window=spin, width=90, height=32)
+    texto_p(163, f"Tu PC tiene {total_ram} GB · máximo permitido: {ram_max} GB", ("Segoe UI", 8), "#6f826f")
     chk = tk.Checkbutton(panel_cfg, text="Generar logs (Launcher + Juego)", variable=var_logs,
                          font=("Segoe UI", 10), bg="#142016", fg="white", activebackground="#142016",
                          activeforeground="white", selectcolor=C_CAMPO, cursor="hand2", bd=0,
                          highlightthickness=0)
-    panel_cfg.create_window(W // 2, 243, window=chk)
-    texto_p(266, "Se guardan en .minecraft\\Pipolauncher\\logs", ("Segoe UI", 8), "#6f826f")
+    panel_cfg.create_window(W // 2, 192, window=chk)
+    texto_p(213, "Se guardan en .minecraft\\Pipolauncher\\logs", ("Segoe UI", 8), "#6f826f")
+    chk_perf = tk.Checkbutton(panel_cfg, text="Perfil independiente por versión", variable=var_perfiles,
+                              font=("Segoe UI", 10), bg="#142016", fg="white", activebackground="#142016",
+                              activeforeground="white", selectcolor=C_CAMPO, cursor="hand2", bd=0,
+                              highlightthickness=0)
+    panel_cfg.create_window(W // 2, 243, window=chk_perf)
+    texto_p(264, "Mods, config, mundos y opciones separados en cada versión", ("Segoe UI", 8), "#6f826f")
 
     def aplicar():
         try:
@@ -1957,6 +2183,7 @@ def main():
             return False
         cfg["ram"] = v
         cfg["logs"] = bool(var_logs.get())
+        cfg["perfiles"] = bool(var_perfiles.get())
         guardar_config(cfg)
         return True
 
@@ -1969,16 +2196,36 @@ def main():
             ocultar_config()
             verificar_archivos()
 
-    panel_cfg.create_window(W // 2, 312, width=220, height=40,
+    def abrir_perfil():
+        """Abre en el Explorador la carpeta de juego del perfil de la versión elegida (o .minecraft si los perfiles
+        están desactivados o la versión es anterior a 1.6)."""
+        vid = id_actual()
+        try:
+            if var_perfiles.get() and vid and not es_version_legacy(vid):
+                ruta = asegurar_perfil(vid)[1]
+            else:
+                ruta = carpeta_minecraft
+            if os.name == "nt":
+                os.startfile(ruta)
+            else:
+                subprocess.Popen(["xdg-open", ruta])
+        except Exception as e:
+            messagebox.showerror("Carpeta del perfil", f"No se pudo abrir la carpeta:\n{e}")
+
+    panel_cfg.create_window(W // 2, 306, width=220, height=40,
                             window=boton(panel_cfg, "GUARDAR", C_VERDE, C_VERDE_H, ("Segoe UI", 12, "bold"),
                                          guardar, fg="#0c1a0c"))
-    panel_cfg.create_window(W // 2, 358, width=220, height=32,
+    panel_cfg.create_window(W // 2, 348, width=220, height=30,
+                            window=boton(panel_cfg, "Abrir carpeta del perfil", "#2a3d2a", "#3a5a3a",
+                                         ("Segoe UI", 10), abrir_perfil))
+    panel_cfg.create_window(W // 2, 386, width=220, height=30,
                             window=boton(panel_cfg, "Verificar archivos", "#2a3d2a", "#3a5a3a",
                                          ("Segoe UI", 10), verificar))
 
     def mostrar_config():
         var_ram.set(str(cfg["ram"]))
         var_logs.set(cfg["logs"])
+        var_perfiles.set(cfg["perfiles"])
         panel_cfg.place(x=0, y=0)
         en_config[0] = True
         btn_cfg.configure(text="⌂")  # casa: vuelve a la pantalla principal sin guardar
