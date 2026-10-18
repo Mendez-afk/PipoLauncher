@@ -7,7 +7,7 @@
 
 PipoLauncher es un proyecto independiente creado con fines educativos y de utilidad personal. Este software no está afiliado, respaldado, asociado ni patrocinado por Mojang AB, Microsoft Corporation ni ninguna de sus filiales. 'Minecraft' es una marca comercial de Mojang Synergies AB. Se recomienda a todos los usuarios adquirir una copia oficial del juego para apoyar a los desarrolladores.
 
-- El proyecto se encuentra en su mayoria hecho con IA. el proyecto existe unicamente con el fin de comprender el idioma de programacion Python con las distintas librerias incluidas.
+- Este proyecto fue desarrollado en su mayoría utilizando Inteligencia Artificial. Su único propósito es facilitar la comprensión del lenguaje de programación Python y el uso de sus diferentes librerías en un entorno práctico, como lo es la creación de un Launcher.
 
 SISTEMA OPERATIVO  -  (verificado)
 ----------------------------------
