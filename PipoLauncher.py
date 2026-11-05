@@ -15,6 +15,10 @@ import traceback
 import shutil
 import urllib.request
 import urllib.error
+import urllib.parse
+import io
+import base64
+import shlex
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from PIL import Image, ImageTk
@@ -72,7 +76,7 @@ URL_ADOPTIUM = "https://api.adoptium.net/v3"   # Eclipse Temurin: Java para inst
 # Actualizaciones del propio launcher (GitHub Releases).
 # IMPORTANTE: subí VERSION en cada release, antes de compilar el .exe, y que coincida con el tag de la release
 # (ej. VERSION = "1.1.0"  ->  tag "v1.1.0"). Si no coinciden, el launcher se ofrecería actualizar a sí mismo en bucle.
-VERSION = "0.1.1.3"
+VERSION = "0.1.1.5"
 GITHUB_REPO = "Mendez-afk/PipoLauncher"
 ASSET_EXE = "PipoLauncher.exe"   # nombre del .exe que se sube como archivo de la release
 # Se lee la LISTA de releases (no /releases/latest, que ignora las pre-releases) y se toma la de versión más alta
@@ -98,7 +102,7 @@ TIPOS_VANILLA = ("release",)
 # ---------------------------------------------------------------------------
 def cargar_config():
     cfg = {"usuario": "Invitado", "ram": 4, "version": "", "logs": True, "instalado": False, "java_local": False,
-           "perfiles": True}
+           "perfiles": True, "perfil": "", "perfiles_migrado": False}
     if os.path.exists(ruta_config):
         try:
             with open(ruta_config, "r", encoding="utf-8") as f:
@@ -125,6 +129,8 @@ def cargar_config():
     cfg["instalado"] = bool(cfg.get("instalado", False))
     cfg["java_local"] = bool(cfg.get("java_local", False))
     cfg["perfiles"] = bool(cfg.get("perfiles", True))
+    cfg["perfil"] = str(cfg.get("perfil") or "")
+    cfg["perfiles_migrado"] = bool(cfg.get("perfiles_migrado", False))
     return cfg
 
 def guardar_config(cfg):
@@ -133,15 +139,289 @@ def guardar_config(cfg):
         json.dump(cfg, f, indent=2)
 
 # ---------------------------------------------------------------------------
-# PERFILES POR VERSIÓN
-# Cada versión tiene su propia carpeta de juego (el --gameDir de Minecraft):
-#   .minecraft\Pipolauncher\profiles\<versión>\game\          options.txt, servers.dat, mods\, config\, saves\,
-#                                                             resourcepacks\, shaderpacks\, screenshots\, logs\ ...
-#   .minecraft\Pipolauncher\profiles\<versión>\profile.json   metadatos del perfil
-# Así los mods, la configuración y los mundos de una versión (o de un loader) no se mezclan con los de otra.
-# Lo pesado y común sigue compartido en .minecraft: versions, libraries, assets, runtime y natives.
+# CUENTA MICROSOFT (Minecraft Java "premium")
+# Inicio de sesión por código de dispositivo: el launcher muestra un código, el jugador lo escribe en
+# microsoft.com/link y Microsoft entrega un token. Con él se encadena: Xbox Live -> XSTS -> Minecraft.
+# No hay contraseñas ni secretos en el launcher (app pública). Solo se guarda el token de renovación, cifrado con
+# la cuenta de Windows (DPAPI); el token de Minecraft (24 h) se pide de nuevo en cada lanzamiento. Nunca se imprime.
 # ---------------------------------------------------------------------------
-PERFIL_SCHEMA = 1
+MS_CLIENT_ID = "2317a231-d53a-4864-bd89-7ffd916447f8"
+MS_BASE = "https://login.microsoftonline.com/consumers/oauth2/v2.0"
+MS_SCOPE = "XboxLive.signin offline_access"
+ruta_cuentas = os.path.join(carpeta_pipolauncher, "accounts.json")
+_UA = {"User-Agent": f"PipoLauncher/{VERSION}", "Accept": "application/json"}
+_XSTS_ERRORES = {
+    2148916233: "Esa cuenta Microsoft no tiene perfil de Xbox (crealo en xbox.com e intentá de nuevo).",
+    2148916235: "Xbox Live no está disponible en el país de esa cuenta.",
+    2148916236: "La cuenta necesita verificación de adulto en Xbox.",
+    2148916237: "La cuenta necesita verificación de adulto en Xbox.",
+    2148916238: "Es una cuenta de menor: debe agregarse a una familia de Microsoft.",
+}
+
+class ErrorMicrosoft(Exception):
+    """Error del inicio de sesión con un mensaje listo para mostrar. 'renovar' = hay que volver a iniciar sesión."""
+    def __init__(self, mensaje, renovar=False):
+        super().__init__(mensaje)
+        self.renovar = renovar
+
+def _http_json(url, datos=None, como_json=False, token=None, timeout=30):
+    """(estado HTTP, dict). No lanza por errores HTTP; los de red se convierten en ErrorMicrosoft."""
+    cab = dict(_UA)
+    cuerpo = None
+    if datos is not None:
+        if como_json:
+            cuerpo, cab["Content-Type"] = json.dumps(datos).encode(), "application/json"
+        else:
+            cuerpo = urllib.parse.urlencode(datos).encode()
+            cab["Content-Type"] = "application/x-www-form-urlencoded"
+    if token:
+        cab["Authorization"] = "Bearer " + token
+    req = urllib.request.Request(url, cuerpo, cab)
+    ultimo = None
+    for i in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.status, json.loads(r.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            try:
+                return e.code, json.loads(e.read() or b"{}")
+            except ValueError:
+                return e.code, {}
+        except (OSError, ValueError) as e:
+            ultimo = e
+            if i < 2:
+                time.sleep(2)
+    host = urllib.parse.urlsplit(url).hostname
+    raise ErrorMicrosoft(f"No hay conexión con {host} ({getattr(ultimo, 'reason', ultimo)}). Revisá tu internet.")
+
+def ms_pedir_codigo():
+    est, d = _http_json(MS_BASE + "/devicecode", {"client_id": MS_CLIENT_ID, "scope": MS_SCOPE})
+    if est != 200 or "user_code" not in d:
+        raise ErrorMicrosoft(f"Microsoft rechazó la solicitud: {d.get('error_description') or d.get('error') or est}")
+    return d
+
+def ms_esperar_token(d, cancelado):
+    """Espera a que el jugador ingrese el código. 'cancelado' es un threading.Event. Devuelve la respuesta de tokens."""
+    limite = time.time() + int(d.get("expires_in", 900))
+    espera = max(2, int(d.get("interval", 5)))
+    while time.time() < limite:
+        if cancelado.wait(espera):
+            raise ErrorMicrosoft("Inicio de sesión cancelado.")
+        est, t = _http_json(MS_BASE + "/token", {"grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                                                 "client_id": MS_CLIENT_ID, "device_code": d["device_code"]})
+        if est == 200 and "access_token" in t:
+            return t
+        err = t.get("error")
+        if err == "slow_down":
+            espera += 5
+        elif err != "authorization_pending":
+            raise ErrorMicrosoft("No se pudo iniciar sesión: " + str(t.get("error_description") or err))
+    raise ErrorMicrosoft("Se acabó el tiempo sin que se ingresara el código. Probá de nuevo.")
+
+def ms_renovar(refresh):
+    est, t = _http_json(MS_BASE + "/token", {"grant_type": "refresh_token", "client_id": MS_CLIENT_ID,
+                                             "refresh_token": refresh, "scope": MS_SCOPE})
+    if est != 200 or "access_token" not in t:
+        raise ErrorMicrosoft("La sesión de Microsoft venció. Iniciá sesión de nuevo.", renovar=True)
+    return t
+
+def ms_cadena_minecraft(token_ms):
+    """Token de Microsoft -> Xbox Live -> XSTS -> Minecraft. Devuelve {'token', 'expira', 'uuid', 'nombre', 'skin'}."""
+    est, x = _http_json("https://user.auth.xboxlive.com/user/authenticate", {
+        "Properties": {"AuthMethod": "RPS", "SiteName": "user.auth.xboxlive.com", "RpsTicket": "d=" + token_ms},
+        "RelyingParty": "http://auth.xboxlive.com", "TokenType": "JWT"}, como_json=True)
+    if est != 200 or "Token" not in x:
+        raise ErrorMicrosoft(f"Falló la autenticación con Xbox Live (HTTP {est}).")
+    est, xs = _http_json("https://xsts.auth.xboxlive.com/xsts/authorize", {
+        "Properties": {"SandboxId": "RETAIL", "UserTokens": [x["Token"]]},
+        "RelyingParty": "rp://api.minecraftservices.com/", "TokenType": "JWT"}, como_json=True)
+    if est != 200 or "Token" not in xs:
+        raise ErrorMicrosoft(_XSTS_ERRORES.get(xs.get("XErr"), f"Xbox rechazó la cuenta (HTTP {est}, XErr {xs.get('XErr')})."))
+    uhs = xs["DisplayClaims"]["xui"][0]["uhs"]
+    est, m = _http_json("https://api.minecraftservices.com/authentication/login_with_xbox",
+                        {"identityToken": f"XBL3.0 x={uhs};{xs['Token']}"}, como_json=True)
+    if est == 403:
+        raise ErrorMicrosoft("Minecraft rechazó la aplicación del launcher (HTTP 403).")
+    if est != 200 or "access_token" not in m:
+        raise ErrorMicrosoft(f"Minecraft rechazó el inicio de sesión (HTTP {est}).")
+    est, pf = _http_json("https://api.minecraftservices.com/minecraft/profile", token=m["access_token"])
+    if est == 404:
+        raise ErrorMicrosoft("Esta cuenta Microsoft no tiene Minecraft Java Edition, así que Mojang no le entrega nombre, UUID ni token para jugar. Podés seguir jugando sin cuenta (modo offline).")
+    if est != 200 or "id" not in pf:
+        raise ErrorMicrosoft(f"No se pudo leer el perfil de Minecraft (HTTP {est}).")
+    uid = pf["id"]
+    uid = f"{uid[0:8]}-{uid[8:12]}-{uid[12:16]}-{uid[16:20]}-{uid[20:]}" if "-" not in uid else uid
+    skin = next((k.get("url") for k in pf.get("skins", []) if k.get("state") == "ACTIVE"), None)
+    gamertag, foto = xbox_perfil(x["Token"])
+    return {"token": m["access_token"], "expira": time.time() + int(m.get("expires_in", 86400)),
+            "uuid": uid, "nombre": pf.get("name") or "Jugador", "skin": skin, "gamertag": gamertag, "foto": foto}
+
+def xbox_perfil(token_xbl):
+    """(gamertag, URL de la foto) de Xbox Live. Es solo cosmético: si algo falla devuelve (None, None) y se usa el
+    nombre y la skin de Minecraft."""
+    try:
+        est, xs = _http_json("https://xsts.auth.xboxlive.com/xsts/authorize", {
+            "Properties": {"SandboxId": "RETAIL", "UserTokens": [token_xbl]},
+            "RelyingParty": "http://xboxlive.com", "TokenType": "JWT"}, como_json=True)
+        if est != 200 or "Token" not in xs:
+            return None, None
+        uhs = xs["DisplayClaims"]["xui"][0]["uhs"]
+        req = urllib.request.Request(
+            "https://profile.xboxlive.com/users/me/profile/settings?settings=Gamertag,GameDisplayPicRaw",
+            headers={**_UA, "Authorization": f"XBL3.0 x={uhs};{xs['Token']}", "x-xbl-contract-version": "2"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            ajustes = json.loads(r.read() or b"{}")["profileUsers"][0]["settings"]
+        val = {a.get("id"): a.get("value") for a in ajustes}
+        return (val.get("Gamertag") or None), (val.get("GameDisplayPicRaw") or None)
+    except Exception:
+        return None, None
+
+# ----- almacenamiento cifrado (DPAPI: solo esta cuenta de Windows puede descifrarlo) -----
+def _dpapi(datos, cifrar):
+    from ctypes import wintypes
+
+    class _Blob(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.c_void_p)]
+    crypt32, kernel32 = ctypes.windll.crypt32, ctypes.windll.kernel32
+    f = crypt32.CryptProtectData if cifrar else crypt32.CryptUnprotectData
+    f.argtypes = [ctypes.POINTER(_Blob), ctypes.c_void_p, ctypes.POINTER(_Blob), ctypes.c_void_p,
+                  ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(_Blob)]
+    f.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    buf = ctypes.create_string_buffer(datos, len(datos))
+    entrada = _Blob(len(datos), ctypes.cast(buf, ctypes.c_void_p))
+    salida = _Blob()
+    if not f(ctypes.byref(entrada), None, None, None, None, 0, ctypes.byref(salida)):
+        raise OSError("DPAPI falló")
+    try:
+        return ctypes.string_at(salida.pbData, salida.cbData)
+    finally:
+        kernel32.LocalFree(salida.pbData)
+
+def proteger(texto):
+    """Cifra un texto para guardarlo en disco (base64). Fuera de Windows (solo pruebas) queda sin cifrar."""
+    crudo = texto.encode("utf-8")
+    return base64.b64encode(_dpapi(crudo, True) if os.name == "nt" else crudo).decode("ascii")
+
+def desproteger(b64):
+    crudo = base64.b64decode(b64)
+    return (_dpapi(crudo, False) if os.name == "nt" else crudo).decode("utf-8")
+
+def leer_cuenta():
+    """Cuenta guardada (dict con nombre, uuid, skin y 'refresh' descifrado) o None."""
+    d = leer_json_dict(ruta_cuentas)
+    c = (d or {}).get("cuenta")
+    if not isinstance(c, dict) or not c.get("refresh") or not c.get("uuid"):
+        return None
+    try:
+        return {"nombre": c.get("nombre") or "Jugador", "uuid": c["uuid"], "skin": c.get("skin"),
+                "gamertag": c.get("gamertag"), "foto": c.get("foto"), "refresh": desproteger(c["refresh"])}
+    except Exception:
+        return None  # archivo de otra PC/usuario o dañado: toca iniciar sesión de nuevo
+
+def guardar_cuenta(nombre, uuid_, skin, refresh, gamertag=None, foto=None):
+    os.makedirs(carpeta_pipolauncher, exist_ok=True)
+    guardar_json_atomico(ruta_cuentas, {"schema": 1, "cuenta": {
+        "nombre": nombre, "uuid": uuid_, "skin": skin, "gamertag": gamertag, "foto": foto,
+        "refresh": proteger(refresh)}})
+
+def borrar_cuenta():
+    for ruta in (ruta_cuentas,):
+        try:
+            os.remove(ruta)
+        except OSError:
+            pass
+    try:
+        for f in os.listdir(carpeta_pipolauncher):
+            if f.startswith("cara_") and f.endswith(".png"):
+                os.remove(os.path.join(carpeta_pipolauncher, f))
+    except OSError:
+        pass
+
+def completar_sesion(tokens_ms):
+    """Tokens de Microsoft -> sesión de Minecraft, y guarda la cuenta (con el refresh token nuevo, que rota)."""
+    ses = ms_cadena_minecraft(tokens_ms["access_token"])
+    guardar_cuenta(ses["nombre"], ses["uuid"], ses["skin"], tokens_ms.get("refresh_token") or "",
+                   ses.get("gamertag"), ses.get("foto"))
+    return ses
+
+def sesion_guardada():
+    """Sesión de Minecraft vigente para la cuenta guardada (renueva los tokens). ErrorMicrosoft si no se puede."""
+    c = leer_cuenta()
+    if not c:
+        raise ErrorMicrosoft("No hay una cuenta guardada. Iniciá sesión.", renovar=True)
+    return completar_sesion(ms_renovar(c["refresh"]))
+
+def datos_cuenta(ses):
+    """Lo que la interfaz necesita de una sesión (sin tokens)."""
+    return {"nombre": ses["nombre"], "uuid": ses["uuid"], "skin": ses.get("skin"),
+            "gamertag": ses.get("gamertag"), "foto": ses.get("foto")}
+
+def nombre_visible(c):
+    """Lo que se muestra: el gamertag de Xbox (o, si no se pudo leer, el nombre de Minecraft)."""
+    return c.get("gamertag") or c["nombre"]
+
+def ruta_cara(c):
+    """Archivo de caché de la foto; cambia si cambia la foto o la skin, así se renueva sola."""
+    fuente = c.get("foto") or c.get("skin") or ""
+    h = hashlib.md5(fuente.encode("utf-8")).hexdigest()[:8]
+    return os.path.join(carpeta_pipolauncher, f"cara_{re.sub('[^0-9a-fA-F]', '', c['uuid'])}_{h}.png")
+
+def _bajar_imagen(url, tope=3_000_000):
+    req = urllib.request.Request(url, headers=_UA)
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return Image.open(io.BytesIO(r.read(tope))).convert("RGBA")
+
+def descargar_cara(c):
+    """Foto de la cuenta (64x64): la de Xbox y, si no hay o falla, la cara de la skin de Minecraft.
+    Se guarda en caché. Devuelve la ruta o None."""
+    destino = ruta_cara(c)
+    if os.path.isfile(destino):
+        return destino
+    img = None
+    foto = c.get("foto")
+    if foto and foto.startswith("https://") and (urllib.parse.urlsplit(foto).hostname or "").endswith("xboxlive.com"):
+        try:
+            img = _bajar_imagen(foto + ("&" if "?" in foto else "?") + "format=png&w=128&h=128").resize((64, 64), Image.LANCZOS)
+        except Exception:
+            img = None
+    skin_url = c.get("skin")
+    if img is None and skin_url and skin_url.startswith("https://textures.minecraft.net/"):
+        try:
+            skin = _bajar_imagen(skin_url, 2_000_000)
+            img = skin.crop((8, 8, 16, 16))
+            if skin.height >= 16:
+                img.alpha_composite(skin.crop((40, 8, 48, 16)))
+            img = img.resize((64, 64), Image.NEAREST)
+        except Exception:
+            img = None
+    if img is None:
+        return None
+    try:
+        prefijo = os.path.basename(destino).rsplit("_", 1)[0] + "_"
+        for f in os.listdir(carpeta_pipolauncher):  # fotos viejas de la misma cuenta
+            if f.startswith(prefijo) and f.endswith(".png"):
+                os.remove(os.path.join(carpeta_pipolauncher, f))
+        img.save(destino)
+        return destino
+    except OSError:
+        return None
+
+def ocultar_secretos(texto, *secretos):
+    for sec in secretos:
+        if sec and len(sec) > 8:
+            texto = texto.replace(sec, "***")
+    return texto
+
+# ---------------------------------------------------------------------------
+# PERFILES
+# Un perfil = nombre + versión de Minecraft + parámetros de lanzamiento + su propia carpeta de juego:
+#   .minecraft\Pipolauncher\profiles\<id>\game\          options.txt, servers.dat, mods\, config\, saves\ ...
+#   .minecraft\Pipolauncher\profiles\<id>\profile.json   nombre, versión, parámetros y metadatos
+# Así los mods, la configuración y los mundos de un perfil no se mezclan con los de otro (aunque usen la misma
+# versión). Lo pesado y común sigue compartido en .minecraft: versions, libraries, assets, runtime y natives.
+# ---------------------------------------------------------------------------
+PERFIL_SCHEMA = 2
 # Se copian de .minecraft al crear un perfil: datos personales que sirven en cualquier versión. Los mods y la
 # config de mods NO se copian (son de un loader/versión concretos y podrían romper otra) y los mundos se preguntan.
 IMPORTAR_AL_CREAR = ("options.txt", "optionsof.txt", "servers.dat", "resourcepacks")
@@ -150,12 +430,12 @@ LIMITE_IMPORTAR_MB = 300
 def ahora_iso():
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
-def nombre_carpeta_perfil(vid):
-    """El id de versión como nombre de carpeta válido en Windows."""
-    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(vid)).strip(" .") or "perfil"
+def nombre_carpeta_perfil(texto):
+    """Un nombre cualquiera como nombre de carpeta válido en Windows."""
+    return re.sub(r'[<>:"/\\|?*\x00-\x1f\s]+', "_", str(texto)).strip(" ._") or "perfil"
 
-def ruta_perfil(vid):
-    return os.path.join(carpeta_perfiles, nombre_carpeta_perfil(vid))
+def ruta_perfil(pid):
+    return os.path.join(carpeta_perfiles, pid)
 
 def leer_json_dict(ruta):
     try:
@@ -240,51 +520,177 @@ def es_version_legacy(vid):
     except Exception:
         return False
 
-def asegurar_perfil(vid):
-    """Crea (si falta) y devuelve el perfil de una versión: (datos del profile.json, carpeta de juego, es_nuevo).
-    Es idempotente y tolera un profile.json dañado (lo respalda como .bak y lo regenera sin perder el juego)."""
-    raiz = ruta_perfil(vid)
-    juego = os.path.join(raiz, "game")
-    ruta_json = os.path.join(raiz, "profile.json")
-    os.makedirs(juego, exist_ok=True)
-    nuevo = not os.path.exists(ruta_json)
-    datos = leer_json_dict(ruta_json)
-    if datos is None:
-        if not nuevo:
+def leer_perfil(pid):
+    d = leer_json_dict(os.path.join(ruta_perfil(pid), "profile.json"))
+    if d is None or not str(d.get("version") or "").strip():
+        return None
+    d["id"] = pid
+    d["nombre"] = str(d.get("nombre") or d["version"]).strip() or d["version"]
+    d["args"] = str(d.get("args") or "")
+    return d
+
+def listar_perfiles():
+    """Perfiles existentes, ordenados por nombre."""
+    try:
+        carpetas = os.listdir(carpeta_perfiles)
+    except OSError:
+        return []
+    res = [p for p in (leer_perfil(c) for c in carpetas) if p]
+    res.sort(key=lambda p: (p["nombre"].lower(), p["id"]))
+    return res
+
+def guardar_perfil(datos):
+    guardar_json_atomico(os.path.join(ruta_perfil(datos["id"]), "profile.json"), datos)
+
+def crear_perfil(nombre, version, args=""):
+    """Crea la carpeta y el profile.json de un perfil nuevo y lo devuelve."""
+    nombre = " ".join(str(nombre).split())
+    if not nombre or not version:
+        raise ValueError("Falta el nombre o la versión.")
+    pid = f"{nombre_carpeta_perfil(nombre)[:40]}-{os.urandom(3).hex()}"
+    os.makedirs(os.path.join(ruta_perfil(pid), "game"), exist_ok=True)
+    datos = {"schema": PERFIL_SCHEMA, "nombre": nombre, "version": version, "args": args.strip(),
+             "creado": ahora_iso(), "ultimo_uso": None, "veces_jugado": 0, "importado": [], "omitidos": [],
+             "mundos": None, "preparado": False}
+    guardar_json_atomico(os.path.join(ruta_perfil(pid), "profile.json"), datos)
+    datos["id"] = pid
+    return datos
+
+def eliminar_perfil(pid):
+    """Borra la carpeta del perfil (con sus mods y mundos). Solo si está dentro de la carpeta de perfiles."""
+    raiz = os.path.realpath(ruta_perfil(pid))
+    base = os.path.realpath(carpeta_perfiles)
+    if not pid or os.path.dirname(raiz) != base:
+        raise ValueError("Ruta de perfil no válida.")
+    shutil.rmtree(raiz)
+
+def migrar_perfiles_antiguos(cfg):
+    """Perfiles del sistema anterior (una carpeta por versión, sin nombre): se conservan tal cual como perfiles
+    con el nombre de su versión. Si no hay ninguno y ya se había elegido una versión instalada, se crea uno con ella."""
+    try:
+        carpetas = os.listdir(carpeta_perfiles)
+    except OSError:
+        carpetas = []
+    for c in carpetas:
+        d = leer_json_dict(os.path.join(carpeta_perfiles, c, "profile.json"))
+        if d is None or "nombre" in d or not d.get("version"):
+            continue
+        d.update({"schema": PERFIL_SCHEMA, "nombre": d["version"], "args": "", "preparado": True})
+        try:
+            guardar_json_atomico(os.path.join(carpeta_perfiles, c, "profile.json"), d)
+        except OSError:
+            pass
+    if not cfg.get("perfiles_migrado"):
+        cfg["perfiles_migrado"] = True
+        v = cfg.get("version")
+        if v and not listar_perfiles() and esta_instalada(v):
             try:
-                os.replace(ruta_json, ruta_json + ".bak")
+                p = crear_perfil(v, v)
+                cfg["perfil"] = p["id"]
             except OSError:
                 pass
-        datos = {}
-    base = {"schema": PERFIL_SCHEMA, "version": vid, "creado": ahora_iso(), "ultimo_uso": None,
-            "veces_jugado": 0, "importado": [], "omitidos": [], "mundos": None}
-    cambio = nuevo
-    for clave, valor in base.items():
-        if clave not in datos:
-            datos[clave] = valor
-            cambio = True
+        guardar_config(cfg)
+
+def asegurar_perfil(pid):
+    """Prepara un perfil: (datos, carpeta de juego, es_nuevo). Es idempotente. La primera vez copia a su carpeta las
+    opciones/servidores/resource packs que ya había en .minecraft (sin tocar los originales)."""
+    datos = leer_perfil(pid)
+    if datos is None:
+        raise OSError("El perfil no existe o está dañado.")
+    juego = os.path.join(ruta_perfil(pid), "game")
+    os.makedirs(juego, exist_ok=True)
+    nuevo = not datos.get("preparado")
     if nuevo:
         datos["importado"], datos["omitidos"] = importar_datos_existentes(juego)
+        datos["preparado"] = True
     for sub in ("mods", "resourcepacks", "saves"):  # carpetas que el jugador va a querer encontrar
         os.makedirs(os.path.join(juego, sub), exist_ok=True)
-    if cambio:
-        guardar_json_atomico(ruta_json, datos)
+    if nuevo:
+        guardar_perfil(datos)
     return datos, juego, nuevo
 
-def actualizar_perfil(vid, **cambios):
-    """Cambia campos del profile.json de un perfil existente."""
-    ruta_json = os.path.join(ruta_perfil(vid), "profile.json")
-    datos = leer_json_dict(ruta_json)
-    if datos is None:
-        return
-    datos.update(cambios)
-    guardar_json_atomico(ruta_json, datos)
-
-def registrar_uso(vid):
-    """Anota que el perfil se acaba de jugar (fecha y contador)."""
-    datos = leer_json_dict(os.path.join(ruta_perfil(vid), "profile.json"))
+def actualizar_perfil(pid, **cambios):
+    datos = leer_perfil(pid)
     if datos is not None:
-        actualizar_perfil(vid, ultimo_uso=ahora_iso(), veces_jugado=int(datos.get("veces_jugado") or 0) + 1)
+        datos.update(cambios)
+        guardar_perfil(datos)
+
+def registrar_uso(pid):
+    """Anota que el perfil se acaba de jugar (fecha y contador)."""
+    datos = leer_perfil(pid)
+    if datos is not None:
+        actualizar_perfil(pid, ultimo_uso=ahora_iso(), veces_jugado=int(datos.get("veces_jugado") or 0) + 1)
+
+# ----- parámetros de lanzamiento del perfil -----
+_JVM_PREFIJOS = ("-X", "-D", "-javaagent", "-agentlib", "-agentpath", "-verbose", "-ea", "-da", "-esa", "-dsa",
+                 "--add-opens", "--add-exports", "--add-modules", "--add-reads", "--enable-native-access",
+                 "--illegal-access", "--patch-module", "--limit-modules")
+_JVM_CON_VALOR = ("--add-opens", "--add-exports", "--add-modules", "--add-reads", "--patch-module",
+                  "--limit-modules", "--enable-native-access")
+_PROHIBIDOS = ("-cp", "-classpath", "--class-path", "-jar", "-p", "--module-path", "-m", "--module")
+_AUTH_JUEGO = ("--username", "--uuid", "--accesstoken", "--session", "--usertype", "--xuid", "--clientid")
+
+def parsear_args(texto):
+    """Separa los parámetros de lanzamiento en (jvm, juego, error). Los de Java (-Xmx, -D..., --add-opens...) van
+    antes de la clase principal; el resto (--width, --server...) va al final. Se rechazan los que romperían el
+    arranque o la sesión (classpath, --accessToken...)."""
+    texto = (texto or "").strip()
+    if not texto:
+        return [], [], None
+    try:
+        toks = shlex.split(texto, posix=False)
+    except ValueError as e:
+        return [], [], f"Comillas sin cerrar ({e})."
+    toks = [t[1:-1] if len(t) >= 2 and t[0] == t[-1] and t[0] in "\"'" else t for t in toks]
+    jvm, juego, i = [], [], 0
+    while i < len(toks):
+        t, bajo = toks[i], toks[i].lower()
+        if bajo in _PROHIBIDOS:
+            return [], [], f"«{t}» no se puede usar: el launcher lo define solo."
+        if bajo in _AUTH_JUEGO:
+            return [], [], f"«{t}» lo define el launcher según tu cuenta."
+        if t.startswith(_JVM_PREFIJOS) and not bajo.startswith("-djava.library.path"):
+            jvm.append(t)
+            if t in _JVM_CON_VALOR and i + 1 < len(toks):
+                i += 1
+                jvm.append(toks[i])
+        elif bajo.startswith("-djava.library.path"):
+            return [], [], "«-Djava.library.path» lo define el launcher."
+        elif t.startswith("-") and not t.startswith("--"):
+            return [], [], f"«{t}» no parece un parámetro válido (los del juego empiezan con --)."
+        else:
+            juego.append(t)
+        i += 1
+    return jvm, juego, None
+
+# ---------------------------------------------------------------------------
+# VERSIONES PARA ELEGIR AL CREAR UN PERFIL (con filtros como el launcher original)
+# ---------------------------------------------------------------------------
+TIPOS_FILTRO = (("release", "Releases"), ("snapshot", "Snapshots"), ("old_beta", "Betas"),
+                ("old_alpha", "Alphas"), ("mods", "Mods / Forge / Fabric"))
+
+def versiones_para_perfil(manifiesto, tipos):
+    """Ids de versión de la más nueva a la más vieja, solo de los tipos marcados. 'mods' incluye las versiones
+    locales que Mojang no conoce (Forge, Fabric, OptiFine...), debajo de su versión base. Sin manifiesto
+    (sin internet la primera vez) se ven todas las versiones instaladas."""
+    locales = listar_versiones()
+    if not manifiesto:
+        return list(locales)
+    todas = manifiesto.get("versions", [])
+    conocidas = {v["id"] for v in todas}
+    hijas, sueltas = {}, []
+    for nombre in locales:
+        if nombre in conocidas:
+            continue
+        raiz = raiz_de(nombre)
+        (hijas.setdefault(raiz, []) if raiz in conocidas else sueltas).append(nombre)
+    ids = list(sueltas) if "mods" in tipos else []
+    for v in todas:
+        if v.get("type") in tipos:
+            ids.append(v["id"])
+        if "mods" in tipos:
+            ids.extend(hijas.get(v["id"], []))
+    return ids
 
 def importar_mundos(juego):
     """Copia .minecraft\\saves al perfil (los originales quedan intactos). Devuelve True si salió bien."""
@@ -531,10 +937,15 @@ def buscar_java(data):
             return c
     raise JavaNoEncontrado(comp, mayor, candidatos)
 
-def construir_comando(vid, usuario, ram, uuid_jugador, con_logs=False, dir_juego=None):
-    """dir_juego: carpeta de juego del perfil (--gameDir). Sin ella se usa .minecraft como antes."""
+def construir_comando(vid, usuario, ram, uuid_jugador, con_logs=False, dir_juego=None, args_extra="", sesion=None):
+    """dir_juego: carpeta de juego del perfil (--gameDir). Sin ella se usa .minecraft como antes.
+    args_extra: parámetros de lanzamiento del perfil (texto). sesion: {'token'} de una cuenta Microsoft; sin ella
+    se juega en modo offline con el nick y UUID dados."""
     data = cargar_version(vid)
     java = buscar_java(data)
+    extra_jvm, extra_juego, err_args = parsear_args(args_extra)
+    if err_args:
+        raise ValueError("Parámetros de lanzamiento del perfil: " + err_args)
 
     natives_dir = os.path.join(carpeta_minecraft, "bin", "pipolauncher", vid)
     os.makedirs(natives_dir, exist_ok=True)
@@ -591,6 +1002,10 @@ def construir_comando(vid, usuario, ram, uuid_jugador, con_logs=False, dir_juego
         "game_assets": os.path.join(carpeta_assets, "virtual", (data.get("assetIndex") or {}).get("id") or "legacy"),
     }
 
+    if sesion:  # cuenta Microsoft: datos reales (los de <=1.6 leen auth_session; los nuevos, access_token)
+        variables.update({"auth_access_token": sesion["token"], "auth_session": f"token:{sesion['token']}:{uuid_jugador.replace('-', '')}",
+                          "user_type": "msa"})
+
     # JVM
     if data.get("arguments", {}).get("jvm"):
         jvm = lista_args(data["arguments"]["jvm"])
@@ -615,7 +1030,7 @@ def construir_comando(vid, usuario, ram, uuid_jugador, con_logs=False, dir_juego
 
     jvm = limpiar([sustituir(a, variables) for a in jvm])
     juego = limpiar([sustituir(a, variables) for a in juego])
-    return [java] + memoria + jvm + [data["mainClass"]] + juego, faltan
+    return [java] + memoria + jvm + extra_jvm + [data["mainClass"]] + juego + extra_juego, faltan
 
 def iniciar(cmd, registro=None, cwd=None):
     """Sin logs: lanza el juego y se olvida de él. Con logs: captura su salida hacia el registro.
@@ -628,6 +1043,15 @@ def iniciar(cmd, registro=None, cwd=None):
         cmd = [cmd[0], "@" + ruta_args]
         if registro:
             registro.info(f"Comando demasiado largo, se usa @argfile: {ruta_args}")
+
+        def borrar_argfile():  # Java lo lee al arrancar; después no debe quedar un token en disco
+            try:
+                os.remove(ruta_args)
+            except OSError:
+                pass
+        t = threading.Timer(40, borrar_argfile)
+        t.daemon = True
+        t.start()
     nt = os.name == "nt"
     if registro is None:
         flags = (subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP) if nt else 0
@@ -1594,11 +2018,17 @@ def main():
     total_ram = ram_total_gb()
     ram_max = ram_maxima_gb(total_ram)
     cfg["ram"] = max(1, min(cfg["ram"], ram_max))  # por si el tope cambió desde la última vez
+    try:
+        migrar_perfiles_antiguos(cfg)  # perfiles del sistema anterior (uno por versión) -> perfiles con nombre
+        if os.path.isfile(ruta_args):   # restos de un lanzamiento anterior (podría contener un token)
+            os.remove(ruta_args)
+    except OSError:
+        pass
 
     ventana = tk.Tk()
     ventana.withdraw()  # oculta hasta terminar de revisar actualizaciones (ver el final de main)
     ventana.title("PipoLauncher")
-    W, H, BARRA = 800, 450, 86
+    W, H, BARRA = 960, 540, 96
     x = (ventana.winfo_screenwidth() // 2) - (W // 2)
     y = (ventana.winfo_screenheight() // 2) - (H // 2)
     ventana.geometry(f"{W}x{H}+{x}+{y}")
@@ -1711,27 +2141,37 @@ def main():
 
     # Estado de la ventana
     estado = {"manifiesto": leer_manifiesto_cache(), "no_inst": set(), "aviso": "",
-              "inst": None, "cerrando": False}
+              "inst": None, "cerrando": False, "perfiles": [], "sel": None, "cuenta": leer_cuenta(), "sesion": None}
 
     # Línea de estado: avisos (sin conexión) y, durante una descarga, el avance
     linea = texto(canvas, W // 2, H - BARRA - 18, "", ("Segoe UI", 10, "bold"))
 
     # Barra inferior: nombre | versión | botón principal
     YC = H - BARRA // 2 + 8
-    texto(canvas, 27, H - BARRA + 14, "NOMBRE", ("Segoe UI", 8, "bold"), color=C_GRIS, anchor="w", sombra=False)
-    texto(canvas, 222, H - BARRA + 14, "VERSIÓN", ("Segoe UI", 8, "bold"), color=C_GRIS, anchor="w", sombra=False)
+    lbl_cuenta = texto(canvas, 27, H - BARRA + 14, "NOMBRE (OFFLINE)", ("Segoe UI", 8, "bold"), color=C_GRIS, anchor="w",
+                       sombra=False)
+    texto(canvas, 252, H - BARRA + 14, "PERFIL", ("Segoe UI", 8, "bold"), color=C_GRIS, anchor="w", sombra=False)
 
+    # Esquina de la cuenta. Con sesión: foto + nombre en texto plano (no se edita). Sin sesión: campo editable
+    # con el nick para jugar offline.
+    caja_cuenta = canvas.create_rectangle(27, YC - 17, 227, YC + 17, fill=C_CAMPO, outline=C_BORDE)
     entry_usuario = tk.Entry(ventana, font=("Segoe UI", 12), bg=C_CAMPO, fg="white", insertbackground="white",
                              disabledbackground="#141c14", disabledforeground="#6f826f", relief="flat",
                              highlightthickness=1, highlightbackground=C_BORDE, highlightcolor=C_VERDE)
-    entry_usuario.insert(0, cfg["usuario"])
-    canvas.create_window(27, YC, window=entry_usuario, width=180, height=34, anchor="w")
+    entry_usuario.insert(0, cfg["usuario"] or "Invitado")
+    win_usuario = canvas.create_window(27, YC, window=entry_usuario, width=200, height=34, anchor="w")
+    img_cara = canvas.create_image(33, YC, anchor="w", state="hidden")
+    txt_cuenta = canvas.create_text(33, YC, anchor="w", text="", font=("Segoe UI", 11, "bold"), fill="white")
 
+    TXT_NUEVO = "＋  Crear nuevo perfil"
     combo = ttk.Combobox(ventana, values=[], state="readonly", font=("Segoe UI", 11), style="Pipo.TCombobox")
-    canvas.create_window(222, YC, window=combo, width=235, height=34, anchor="w")
+    canvas.create_window(252, YC, window=combo, width=300, height=34, anchor="w")
+    btn_editar = boton(ventana, "✎", C_CAMPO, "#2d4a2d", ("Segoe UI Symbol", 12), lambda: dialogo_perfil(perfil_actual()))
+    btn_editar.configure(highlightthickness=1, highlightbackground=C_BORDE)
+    canvas.create_window(556, YC, window=btn_editar, width=34, height=34, anchor="w")
 
     # Botón principal (Jugar / Descargar) y, mientras se descarga, barra de progreso + cancelar
-    BX, BW, BH = 478, 300, 50
+    BX, BW, BH = 606, 330, 54
     btn_jugar = boton(ventana, "JUGAR", C_VERDE, C_VERDE_H, ("Segoe UI", 17, "bold"),
                       lambda: lanzar(), fg="#0c1a0c")
     win_jugar = canvas.create_window(BX, YC - 2, window=btn_jugar, width=BW, height=BH, anchor="w")
@@ -1764,26 +2204,46 @@ def main():
     btn_info.bind("<Enter>", lambda e: btn_info.configure(bg="#2d4a2d"))
     btn_info.bind("<Leave>", lambda e: btn_info.configure(bg=C_CAMPO))
 
-    # ----- lista de versiones -----
+    # Iniciar sesión (debajo de ℹ y ⚙, centrado entre los dos)
+    btn_login = tk.Button(ventana, text="Iniciar sesión", font=("Segoe UI", 9, "bold"), bg=C_CAMPO, fg="white",
+                          activebackground="#2d4a2d", activeforeground="white", relief="flat", bd=0,
+                          cursor="hand2", command=lambda: alternar_sesion(),
+                          highlightthickness=1, highlightbackground=C_BORDE)
+    btn_login.place(x=W - 18 - (40 + 8 + 40) // 2, y=18 + 40 + 8, anchor="n", width=96, height=28)
+    btn_login.bind("<Enter>", lambda e: btn_login.configure(bg="#2d4a2d") if str(btn_login["state"]) != "disabled" else None)
+    btn_login.bind("<Leave>", lambda e: btn_login.configure(bg=C_CAMPO))
+
+    # ----- lista de perfiles -----
+    def perfil_actual():
+        i = combo.current()
+        return estado["perfiles"][i] if 0 <= i < len(estado["perfiles"]) else None
+
     def id_actual():
-        t = combo.get()
-        return t[len(PREFIJO_NO_INSTALADA):] if t.startswith(PREFIJO_NO_INSTALADA) else t
+        """Versión de Minecraft del perfil elegido."""
+        p = perfil_actual()
+        return p["version"] if p else ""
 
     def refrescar_lista(manifiesto=None, seleccion=None):
-        """Reconstruye la lista (solo releases; las no instaladas con '[+] ') conservando la selección."""
+        """Reconstruye la lista de perfiles (la versión sin instalar lleva '[+] ') y conserva el elegido."""
         if manifiesto:
             estado["manifiesto"] = manifiesto
-        ids, no_inst = construir_lista(estado["manifiesto"])
-        estado["no_inst"] = no_inst
-        combo["values"] = [(PREFIJO_NO_INSTALADA if v in no_inst else "") + v for v in ids]
-        previa = seleccion or id_actual() or cfg["version"]
-        if previa in ids:
-            elegida = previa
+        previa = seleccion or (perfil_actual() or {}).get("id") or cfg["perfil"]
+        ps = listar_perfiles()
+        estado["perfiles"] = ps
+        conocidas = {v["id"] for v in (estado["manifiesto"] or {}).get("versions", [])}
+        estado["no_inst"] = {p["version"] for p in ps if not esta_instalada(p["version"])
+                             and (p["version"] in conocidas or not os.path.isfile(
+                                 os.path.join(carpeta_versiones, p["version"], p["version"] + ".json")))}
+        combo["values"] = [(PREFIJO_NO_INSTALADA if p["version"] in estado["no_inst"] else "")
+                           + f'{p["nombre"]}  ({p["version"]})' for p in ps] + [TXT_NUEVO]
+        idx = next((i for i, p in enumerate(ps) if p["id"] == previa), 0 if ps else None)
+        if idx is None:
+            combo.set("")
+            estado["sel"] = None
         else:
-            ultima = ((estado["manifiesto"] or {}).get("latest") or {}).get("release")
-            elegida = next((v for v in ids if v not in no_inst), None) or (ultima if ultima in ids else None) \
-                or (ids[0] if ids else "")
-        combo.set((PREFIJO_NO_INSTALADA if elegida in no_inst else "") + elegida)
+            combo.current(idx)
+            estado["sel"] = idx
+            cfg["perfil"], cfg["version"] = ps[idx]["id"], ps[idx]["version"]
         aplicar_boton()
 
     def aplicar_boton():
@@ -1794,19 +2254,345 @@ def main():
         instalada = not vid or vid not in estado["no_inst"]
         canvas.itemconfigure(win_jugar, state="normal" if instalada else "hidden")
         canvas.itemconfigure(win_descargar, state="hidden" if instalada else "normal")
+        btn_editar.configure(state="normal" if perfil_actual() else "disabled")
 
-    def al_elegir_version(_evento=None):
-        cfg["version"] = id_actual()
-        guardar_config(cfg)
+    def al_elegir_perfil(_evento=None):
+        if combo.current() == len(estado["perfiles"]):  # último ítem: «Crear nuevo perfil»
+            if estado["sel"] is None:
+                combo.set("")
+            else:
+                combo.current(estado["sel"])
+            combo.selection_clear()
+            dialogo_perfil(None)
+            return
+        estado["sel"] = combo.current()
+        p = perfil_actual()
+        if p:
+            cfg["perfil"], cfg["version"] = p["id"], p["version"]
+            guardar_config(cfg)
         aplicar_boton()
         combo.selection_clear()
-    combo.bind("<<ComboboxSelected>>", al_elegir_version)
+    combo.bind("<<ComboboxSelected>>", al_elegir_perfil)
+
+    # ----- ventanas auxiliares -----
+    def ventana_modal(titulo, ancho, alto):
+        top = tk.Toplevel(ventana)
+        top.title(titulo)
+        top.configure(bg="#142016")
+        top.resizable(False, False)
+        top.transient(ventana)
+        x = ventana.winfo_x() + (W - ancho) // 2
+        y = ventana.winfo_y() + (H - alto) // 2
+        top.geometry(f"{ancho}x{alto}+{max(x, 0)}+{max(y, 0)}")
+        try:
+            top.iconbitmap(ruta_recurso("icono.ico"))
+        except Exception:
+            pass
+        return top
+
+    def abrir_modal(top):
+        try:
+            top.grab_set()
+        except tk.TclError:
+            pass
+        top.focus_force()
+
+    def dialogo_perfil(perfil):
+        """Crear (perfil=None) o editar un perfil: nombre, versión (con filtros como el launcher original) y parámetros."""
+        editar = perfil is not None
+        top = ventana_modal("Editar perfil" if editar else "Crear nuevo perfil", 480, 470 if editar else 440)
+
+        def etiqueta(y, s_):
+            tk.Label(top, text=s_, font=("Segoe UI", 9, "bold"), bg="#142016", fg=C_GRIS).place(x=24, y=y)
+
+        def campo(var, y):
+            e = tk.Entry(top, textvariable=var, font=("Segoe UI", 12), bg=C_CAMPO, fg="white", insertbackground="white",
+                         relief="flat", highlightthickness=1, highlightbackground=C_BORDE, highlightcolor=C_VERDE)
+            e.place(x=24, y=y, width=432, height=34)
+            return e
+
+        etiqueta(16, "NOMBRE DEL PERFIL")
+        var_nombre = tk.StringVar(value=perfil["nombre"] if editar else "")
+        entrada = campo(var_nombre, 38)
+
+        etiqueta(88, "VERSIÓN DE MINECRAFT")
+        manif = estado["manifiesto"] or {}
+        tipo_actual = next((v.get("type") for v in manif.get("versions", []) if editar and v["id"] == perfil["version"]),
+                           "mods" if editar else "release")
+        marcados = {k: tk.BooleanVar(value=(k in ("release", "mods") or k == tipo_actual)) for k, _n in TIPOS_FILTRO}
+        elegida = [perfil["version"] if editar else None]
+        ids_visibles = [[]]
+        fila = tk.Frame(top, bg="#142016")
+        fila.place(x=24, y=110, width=432, height=28)
+        combo_v = ttk.Combobox(top, values=[], state="readonly", font=("Segoe UI", 11), style="Pipo.TCombobox")
+        combo_v.place(x=24, y=146, width=432, height=34)
+
+        def recargar():
+            tipos = {k for k, v in marcados.items() if v.get()}
+            ids = versiones_para_perfil(estado["manifiesto"], tipos)
+            if editar and perfil["version"] not in ids:
+                ids.insert(0, perfil["version"])  # la del perfil siempre se ve, aunque su filtro esté apagado
+            ids_visibles[0] = ids
+            conocidas = {v["id"] for v in manif.get("versions", [])}
+            combo_v["values"] = [(PREFIJO_NO_INSTALADA if (i in conocidas and not esta_instalada(i)) else "") + i
+                                 for i in ids]
+            if elegida[0] not in ids:
+                ultima = (manif.get("latest") or {}).get("release")
+                elegida[0] = (next((i for i in ids if esta_instalada(i)), None) or (ultima if ultima in ids else None)
+                              or (ids[0] if ids else None))
+            if elegida[0] in ids:
+                combo_v.current(ids.index(elegida[0]))
+            else:
+                combo_v.set("")
+
+        def al_elegir_v(_e=None):
+            i = combo_v.current()
+            elegida[0] = ids_visibles[0][i] if 0 <= i < len(ids_visibles[0]) else None
+            combo_v.selection_clear()
+        combo_v.bind("<<ComboboxSelected>>", al_elegir_v)
+
+        for k, nombre_f in TIPOS_FILTRO:
+            tk.Checkbutton(fila, text=nombre_f, variable=marcados[k], indicatoron=False, command=recargar,
+                           font=("Segoe UI", 8, "bold"), bg=C_CAMPO, fg="white", selectcolor="#3f7a2a",
+                           activebackground="#2d4a2d", activeforeground="white", relief="flat", bd=0,
+                           cursor="hand2", padx=8, pady=3, highlightthickness=1,
+                           highlightbackground=C_BORDE).pack(side="left", padx=(0, 5))
+        recargar()
+
+        etiqueta(196, "PARÁMETROS DE LANZAMIENTO (OPCIONAL)")
+        var_args = tk.StringVar(value=perfil["args"] if editar else "")
+        campo(var_args, 218)
+        tk.Label(top, text="Ej.: -Xmx6G -Dalgo=1 --width 1280 --height 720 --server mi.servidor.com\n"
+                           "Los de Java (-X, -D, --add-opens…) van a la JVM; los demás, al juego.",
+                 font=("Segoe UI", 8), bg="#142016", fg="#6f826f", justify="left").place(x=24, y=258)
+        lbl_err = tk.Label(top, text="", font=("Segoe UI", 9), bg="#142016", fg="#e06c6c", wraplength=430, justify="left")
+        lbl_err.place(x=24, y=298)
+
+        def guardar_p():
+            vid = elegida[0]
+            if not vid:
+                lbl_err.configure(text="Elegí una versión de la lista (probá activar más filtros).")
+                return
+            _j, _g, err = parsear_args(var_args.get())
+            if err:
+                lbl_err.configure(text=err)
+                return
+            nombre = " ".join(var_nombre.get().split()) or vid
+            if editar and vid != perfil["version"] and not messagebox.askyesno(
+                    "Cambiar versión", "Vas a cambiar la versión de este perfil.\n\nSus mods y mundos se conservan, "
+                                       "pero pueden no ser compatibles con la versión nueva.\n\n¿Continuar?",
+                    parent=top):
+                return
+            try:
+                if editar:
+                    actualizar_perfil(perfil["id"], nombre=nombre, version=vid, args=var_args.get().strip())
+                    pid = perfil["id"]
+                else:
+                    pid = crear_perfil(nombre, vid, var_args.get())["id"]
+            except (OSError, ValueError) as e:
+                messagebox.showerror("Perfil", f"No se pudo guardar el perfil:\n{e}", parent=top)
+                return
+            cfg["perfil"], cfg["version"] = pid, vid
+            guardar_config(cfg)
+            top.destroy()
+            refrescar_lista(seleccion=pid)
+
+        def eliminar_p():
+            mb = tam_bytes(ruta_perfil(perfil["id"])) / 1048576
+            if not messagebox.askyesno(
+                    "Eliminar perfil",
+                    f"¿Eliminar el perfil «{perfil['nombre']}»?\n\nSe borra su carpeta de juego (mods, mundos, opciones y "
+                    f"capturas): {mb:.0f} MB.\nNo se puede deshacer. La versión de Minecraft no se borra.",
+                    icon="warning", default="no", parent=top):
+                return
+            try:
+                eliminar_perfil(perfil["id"])
+            except (OSError, ValueError) as e:
+                messagebox.showerror("Perfil", f"No se pudo eliminar el perfil:\n{e}", parent=top)
+                return
+            if cfg["perfil"] == perfil["id"]:
+                cfg["perfil"] = ""
+            top.destroy()
+            refrescar_lista()
+
+        boton(top, "GUARDAR" if editar else "CREAR PERFIL", C_VERDE, C_VERDE_H, ("Segoe UI", 12, "bold"), guardar_p,
+              fg="#0c1a0c").place(x=24, y=348, width=212, height=40)
+        boton(top, "Cancelar", "#2a3d2a", "#3a5a3a", ("Segoe UI", 11), top.destroy).place(x=244, y=348, width=212, height=40)
+        if editar:
+            boton(top, "Eliminar perfil", "#6e2a2a", "#8e3a3a", ("Segoe UI", 9), eliminar_p).place(
+                x=24, y=402, width=432, height=30)
+        top.bind("<Return>", lambda _e: guardar_p())
+        top.bind("<Escape>", lambda _e: top.destroy())
+        abrir_modal(top)
+        entrada.focus_set()
+
+    # ----- cuenta Microsoft -----
+    def poner_cara(ruta):
+        try:
+            ventana.cara = ImageTk.PhotoImage(Image.open(ruta).convert("RGBA").resize((26, 26), Image.NEAREST))
+            canvas.itemconfigure(img_cara, image=ventana.cara)
+        except Exception:
+            canvas.itemconfigure(img_cara, image="")
+
+    def mostrar_cuenta():
+        """Con sesión: foto + gamertag. Sin sesión: «Sin sesión» (se juega offline)."""
+        c = estado["cuenta"]
+        if not c:
+            canvas.itemconfigure(img_cara, state="hidden", image="")
+            canvas.itemconfigure(txt_cuenta, text="")
+            canvas.itemconfigure(caja_cuenta, state="hidden")
+            canvas.itemconfigure(win_usuario, state="normal")
+            cambiar_texto(lbl_cuenta, "NOMBRE (OFFLINE)")
+            btn_login.configure(text="Iniciar sesión")
+            return
+        canvas.itemconfigure(win_usuario, state="hidden")
+        canvas.itemconfigure(caja_cuenta, state="normal")
+        cambiar_texto(lbl_cuenta, "CUENTA")
+        canvas.itemconfigure(txt_cuenta, text=nombre_visible(c), fill="white", font=("Segoe UI", 11, "bold"))
+        canvas.coords(txt_cuenta, 68, YC)
+        canvas.itemconfigure(img_cara, state="normal", image="")
+        btn_login.configure(text="Cerrar sesión")
+        ruta = ruta_cara(c)
+        if os.path.isfile(ruta):
+            poner_cara(ruta)
+            return
+        r = {}
+
+        def bajar():
+            r["ruta"] = descargar_cara(c)
+            r["fin"] = True
+        threading.Thread(target=bajar, daemon=True).start()
+
+        def esperar():
+            if not r.get("fin"):
+                ventana.after(200, esperar)
+            elif r["ruta"] and estado["cuenta"] and estado["cuenta"]["uuid"] == c["uuid"]:
+                poner_cara(r["ruta"])
+        esperar()
+
+    def alternar_sesion():
+        if estado["cuenta"]:
+            if messagebox.askyesno("Cerrar sesión", f"¿Cerrar la sesión de {nombre_visible(estado['cuenta'])}?\n\n"
+                                   "Se borran los datos guardados de la cuenta. Podés volver a jugar sin cuenta "
+                                   "(modo offline con el nombre que escribas) o iniciar sesión de nuevo."):
+                borrar_cuenta()
+                estado["cuenta"] = estado["sesion"] = None
+                mostrar_cuenta()
+        else:
+            dialogo_sesion()
+
+    def dialogo_sesion(al_terminar=None):
+        top = ventana_modal("Iniciar sesión con Microsoft", 440, 350)
+        cancelado = threading.Event()
+        r = {"d": None, "ses": None, "err": None, "fin": False, "fase": "codigo"}
+        tk.Label(top, text="INICIAR SESIÓN CON MICROSOFT", font=("Segoe UI", 12, "bold"), bg="#142016",
+                 fg="white").pack(pady=(18, 4))
+        lbl_info = tk.Label(top, text="Pidiendo el código a Microsoft…", font=("Segoe UI", 10), bg="#142016",
+                            fg=C_GRIS, wraplength=390, justify="center")
+        lbl_info.pack(pady=(0, 6))
+        # El código va en una caja tipo «bloque de código» (se puede seleccionar) con su botón de copiar
+        caja = tk.Frame(top, bg="#0b120b", highlightthickness=1, highlightbackground=C_BORDE)
+        caja.pack(pady=(6, 4))
+        var_codigo = tk.StringVar(value="")
+        ent_codigo = tk.Entry(caja, textvariable=var_codigo, font=("Consolas", 26, "bold"), width=11, justify="center",
+                              state="readonly", readonlybackground="#0b120b", fg=C_VERDE, relief="flat", bd=0,
+                              highlightthickness=0)
+        ent_codigo.pack(side="left", padx=(10, 6), pady=8)
+        btn_copiar = boton(caja, "COPIAR", "#2a3d2a", "#3a5a3a", ("Segoe UI", 10, "bold"), lambda: copiar_codigo())
+        btn_copiar.pack(side="left", padx=(0, 10), ipadx=8, ipady=6)
+        btn_copiar.configure(state="disabled")
+
+        def copiar_codigo():
+            cod = var_codigo.get()
+            if not cod:
+                return
+            try:
+                top.clipboard_clear()
+                top.clipboard_append(cod)
+                top.update()  # que el portapapeles quede disponible
+            except tk.TclError:
+                pass
+            btn_copiar.configure(text="¡COPIADO!")
+            top.after(1500, lambda: btn_copiar.winfo_exists() and btn_copiar.configure(text="COPIAR"))
+        lbl_pasos = tk.Label(top, text="", font=("Segoe UI", 9), bg="#142016", fg=C_GRIS, wraplength=390, justify="center")
+        lbl_pasos.pack()
+        fila_b = tk.Frame(top, bg="#142016")
+        fila_b.pack(pady=(14, 0))
+        btn_abrir = boton(fila_b, "ABRIR PÁGINA", C_VERDE, C_VERDE_H, ("Segoe UI", 11, "bold"), lambda: abrir_pagina(),
+                          fg="#0c1a0c")
+        btn_abrir.pack(side="left", padx=5, ipadx=8, ipady=5)
+        btn_abrir.configure(state="disabled")
+        btn_canc = boton(fila_b, "Cancelar", "#2a3d2a", "#3a5a3a", ("Segoe UI", 10), lambda: cerrar())
+        btn_canc.pack(side="left", padx=5, ipadx=8, ipady=5)
+
+        def abrir_pagina():
+            d = r["d"]
+            if d:
+                copiar_codigo()
+                abrir_url(d.get("verification_uri") or "https://www.microsoft.com/link")
+
+        def cerrar():
+            cancelado.set()
+            top.destroy()
+
+        def hilo():
+            try:
+                r["d"] = ms_pedir_codigo()
+                tokens = ms_esperar_token(r["d"], cancelado)
+                r["fase"] = "cuenta"
+                ses = completar_sesion(tokens)
+                r["ses"] = ses
+                r["cara"] = descargar_cara(ses)
+            except ErrorMicrosoft as e:
+                r["err"] = str(e)
+            except Exception as e:
+                r["err"] = f"Error inesperado: {e}"
+            r["fin"] = True
+        threading.Thread(target=hilo, daemon=True).start()
+
+        def sondear():
+            if not top.winfo_exists():
+                return
+            d = r["d"]
+            if d and not var_codigo.get() and not r["fin"]:
+                var_codigo.set(d["user_code"])
+                btn_copiar.configure(state="normal")
+                lbl_info.configure(text="Abrí la página, escribí este código e iniciá sesión con tu cuenta de Minecraft.")
+                lbl_pasos.configure(text="Copiá el código, pegalo en la página de Microsoft («Abrir página» también lo copia).\nEsta ventana espera hasta que termines.")
+                btn_abrir.configure(state="normal")
+            if r["fase"] == "cuenta" and not r["fin"]:
+                var_codigo.set("")
+                btn_copiar.configure(state="disabled")
+                btn_abrir.configure(state="disabled")
+                lbl_info.configure(text="Verificando tu cuenta de Minecraft…")
+                lbl_pasos.configure(text="")
+            if not r["fin"]:
+                top.after(250, sondear)
+                return
+            if r["err"]:
+                if not cancelado.is_set():
+                    messagebox.showerror("Iniciar sesión", r["err"], parent=top)
+                    top.destroy()
+                return
+            ses = r["ses"]
+            estado["cuenta"] = datos_cuenta(ses)
+            estado["sesion"] = ses
+            top.destroy()
+            mostrar_cuenta()
+            if al_terminar:
+                al_terminar()
+        sondear()
+        top.protocol("WM_DELETE_WINDOW", cerrar)
+        abrir_modal(top)
 
     # ----- trabajos en segundo plano con progreso dentro de la ventana -----
     def bloquear(si):
         entry_usuario.configure(state="disabled" if si else "normal")
         combo.configure(state="disabled" if si else "readonly")
         btn_cfg.configure(state="disabled" if si else "normal")
+        btn_login.configure(state="disabled" if si else "normal")
+        if si:
+            btn_editar.configure(state="disabled")
         canvas.itemconfigure(win_barra, state="normal" if si else "hidden")
         canvas.itemconfigure(win_cancelar, state="normal" if si else "hidden")
         if si:
@@ -1901,16 +2687,21 @@ def main():
 
     # ----- descargar una versión (y lo que le falte) y ejecutarla -----
     def descargar_y_lanzar():
-        usuario = entry_usuario.get().strip()
+        perfil = perfil_actual()
         vid = id_actual()
-        if not usuario or not vid:
-            messagebox.showwarning("Atención", "Completá el nombre y elegí una versión.")
+        if not perfil:
+            messagebox.showwarning("Atención", "Elegí un perfil o creá uno con «Crear nuevo perfil».")
             return
-        cfg["usuario"], cfg["version"] = usuario, vid
+        if not estado["cuenta"]:
+            if not entry_usuario.get().strip():
+                messagebox.showwarning("Atención", "Escribí un nombre para jugar sin sesión.")
+                return
+            cfg["usuario"] = entry_usuario.get().strip()
+        cfg["perfil"], cfg["version"] = perfil["id"], vid
         guardar_config(cfg)
 
         def fin(salida):
-            aplicar_resultado(salida, vid)
+            aplicar_resultado(salida, perfil["id"])
             if problema(salida, descargar_y_lanzar):
                 return
             lanzar(reparado=True)
@@ -1918,17 +2709,75 @@ def main():
 
     # ----- lanzar -----
     def lanzar(reparado=False):
-        usuario = entry_usuario.get().strip()
-        vid = id_actual()
-        if not usuario or not vid:
-            messagebox.showwarning("Atención", "Completá el nombre y elegí una versión.")
+        """Con cuenta Microsoft primero renueva la sesión (en segundo plano); sin cuenta juega en modo offline."""
+        perfil = perfil_actual()
+        if not perfil:
+            messagebox.showwarning("Atención", "Elegí un perfil o creá uno con «Crear nuevo perfil».")
+            return
+        if not estado["cuenta"]:
+            _lanzar(reparado, None)
+            return
+        ses = estado["sesion"]
+        if ses and ses["expira"] - time.time() > 600:  # el token de Minecraft dura 24 h: se reutiliza
+            _lanzar(reparado, ses)
+            return
+        canvas.itemconfigure(win_jugar, state="hidden")
+        canvas.itemconfigure(win_descargar, state="hidden")
+        cambiar_texto(linea, "Verificando tu cuenta de Microsoft…")
+        r = {}
+
+        def hilo():
+            try:
+                r["ses"] = sesion_guardada()
+            except ErrorMicrosoft as e:
+                r["err"] = e
+            except Exception as e:
+                r["err"] = ErrorMicrosoft(f"Error inesperado: {e}")
+            r["fin"] = True
+        threading.Thread(target=hilo, daemon=True).start()
+
+        def esperar():
+            if not r.get("fin"):
+                ventana.after(150, esperar)
+                return
+            cambiar_texto(linea, estado["aviso"])
+            aplicar_boton()
+            if "ses" in r:
+                estado["sesion"] = r["ses"]
+                estado["cuenta"] = datos_cuenta(r["ses"])
+                mostrar_cuenta()
+                _lanzar(reparado, r["ses"])
+                return
+            e = r["err"]
+            if e.renovar:
+                if messagebox.askyesno("Sesión vencida", f"{e}\n\n¿Iniciar sesión ahora?"):
+                    dialogo_sesion(lambda: lanzar(reparado))
+            else:
+                c = estado["cuenta"]
+                if messagebox.askyesno("Sin verificar la cuenta",
+                                       f"No se pudo verificar la cuenta:\n{e}\n\n¿Jugar sin conexión como "
+                                       f"«{c['nombre']}»?\n(No vas a poder entrar a servidores con cuenta premium.)"):
+                    _lanzar(reparado, None, offline_como=c["nombre"])
+        esperar()
+
+    def _lanzar(reparado, sesion, offline_como=None):
+        perfil = perfil_actual()
+        vid = perfil["version"]
+        # Con cuenta el juego usa el nombre de Minecraft; el gamertag es solo para mostrar. Sin cuenta: nick offline fijo
+        usuario = sesion["nombre"] if sesion else (offline_como or entry_usuario.get().strip())
+        if not usuario:
+            messagebox.showwarning("Atención", "Escribí un nombre para jugar sin sesión.")
             return
         if vid in estado["no_inst"]:  # no debería pasar (el botón está oculto), pero por las dudas
             descargar_y_lanzar()
             return
         ram = max(1, min(cfg["ram"], ram_max))
-        uuid_jugador = uuid_offline(usuario)  # se recalcula en cada lanzamiento: otro nick => otro UUID
-        cfg["usuario"], cfg["version"] = usuario, vid
+        # Con cuenta: UUID real de Mojang. Sin cuenta: UUID de modo offline (otro nick => otro UUID)
+        uuid_jugador = sesion["uuid"].replace("-", "") if sesion else uuid_offline(usuario)
+        token = sesion["token"] if sesion else None
+        if not sesion and not offline_como:
+            cfg["usuario"] = usuario  # el nick offline se recuerda para la próxima vez
+        cfg["perfil"], cfg["version"] = perfil["id"], vid
         guardar_config(cfg)
 
         registro = None
@@ -1948,16 +2797,17 @@ def main():
 
         try:
             log(f"PipoLauncher | Windows {platform.version()} | Python {platform.python_version()}")
-            log(f"Usuario: {usuario} | UUID: {uuid_jugador} | Versión: {vid} | RAM: {ram} GB "
+            log(f"Usuario: {usuario} | UUID: {uuid_jugador} | Cuenta Microsoft: {'sí' if sesion else 'no (offline)'} | "
+                f"Perfil: {perfil['nombre']} | Versión: {vid} | RAM: {ram} GB "
                 f"(PC: {total_ram} GB, máximo permitido: {ram_max} GB)")
-            # Perfil de la versión: su propia carpeta de juego (mods, config, mundos, opciones...)
+            # Carpeta de juego propia del perfil (mods, config, mundos, opciones...)
             dir_juego = None
-            if cfg["perfiles"]:
+            if True:
                 try:
                     if es_version_legacy(vid):
                         log("Versión anterior a 1.6: usa .minecraft directamente (sus sonidos están en .minecraft\\resources)")
                     else:
-                        perfil, dir_juego, nuevo = asegurar_perfil(vid)
+                        perfil, dir_juego, nuevo = asegurar_perfil(perfil["id"])
                         if nuevo:
                             log(f"Perfil creado: {dir_juego} | importado: {', '.join(perfil['importado']) or '-'}"
                                 + (f" | omitido por tamaño o error: {', '.join(perfil['omitidos'])}"
@@ -1965,8 +2815,8 @@ def main():
                             hay = mundos_existentes()
                             if hay:
                                 if messagebox.askyesno(
-                                        f"Perfil de {vid}",
-                                        f"Se creó un perfil independiente para {vid}.\n\n"
+                                        f"Perfil {perfil['nombre']}",
+                                        f"Se creó la carpeta de juego del perfil «{perfil['nombre']}».\n\n"
                                         f"Encontramos mundos guardados en .minecraft\\saves ({hay[1]:.0f} MB).\n"
                                         "¿Copiarlos a este perfil?\n\n"
                                         "• Sí: se copian (los originales no se tocan).\n"
@@ -1976,7 +2826,7 @@ def main():
                                     ventana.update()
                                     ok = importar_mundos(dir_juego)
                                     ventana.configure(cursor="")
-                                    actualizar_perfil(vid, mundos=ok)
+                                    actualizar_perfil(perfil["id"], mundos=ok)
                                     log("Mundos copiados al perfil" if ok else "No se pudieron copiar todos los mundos",
                                         "INFO" if ok else "WARN")
                                     if not ok:
@@ -1984,7 +2834,7 @@ def main():
                                             "Mundos", "No se pudieron copiar todos los mundos.\nSiguen intactos en "
                                                       ".minecraft\\saves; podés copiarlos a mano a la carpeta del perfil.")
                                 else:
-                                    actualizar_perfil(vid, mundos=False)
+                                    actualizar_perfil(perfil["id"], mundos=False)
                         else:
                             log(f"Perfil: {dir_juego}")
                 except OSError as e:
@@ -1992,7 +2842,7 @@ def main():
                     log(f"No se pudo preparar el perfil ({e}); se usa .minecraft", "WARN")
             try:
                 cmd, faltan = construir_comando(vid, usuario, ram, uuid_jugador, con_logs=registro is not None,
-                                                dir_juego=dir_juego)
+                                                dir_juego=dir_juego, args_extra=perfil["args"], sesion=sesion)
             except JavaNoEncontrado as e:
                 log(str(e), "WARN")
                 if not reparado:
@@ -2026,12 +2876,12 @@ def main():
                     log("Lanzamiento cancelado por el usuario")
                     cerrar_log()
                     return
-            log("Comando: " + subprocess.list2cmdline(cmd))
+            log("Comando: " + ocultar_secretos(subprocess.list2cmdline(cmd), token))  # el token nunca va al log
             proc, hilo = iniciar(cmd, registro, cwd=dir_juego)
             log("Minecraft iniciado")
             if dir_juego:
                 try:
-                    registrar_uso(vid)
+                    registrar_uso(perfil["id"])
                 except OSError:
                     pass
         except Exception as e:
@@ -2141,16 +2991,16 @@ def main():
     # ----- configuración (en la misma ventana, encima de la principal) -----
     panel_cfg = tk.Canvas(ventana, width=W, height=H, highlightthickness=0, bg="#0c160c")
     panel_cfg.create_image(0, 0, image=ventana.fondo_config, anchor="nw")
-    CX1, CX2, CY1, CY2 = 220, 580, 44, 420
+    DY = (H - 450) // 2   # el diseño original era de 800x450: se baja todo para centrarlo
+    CX1, CX2, CY1, CY2 = W // 2 - 180, W // 2 + 180, 44 + DY, 420 + DY
     panel_cfg.create_rectangle(CX1, CY1, CX2, CY2, fill="#142016", outline=C_BORDE, width=2)
     panel_cfg.create_rectangle(CX1, CY1, CX2, CY1 + 4, fill=C_VERDE, outline=C_VERDE)
     var_ram = tk.StringVar()
     var_logs = tk.BooleanVar()
-    var_perfiles = tk.BooleanVar()
     en_config = [False]
 
     def texto_p(yy, s, fuente, color="white"):
-        panel_cfg.create_text(W // 2, yy, text=s, font=fuente, fill=color)
+        panel_cfg.create_text(W // 2, yy + DY, text=s, font=fuente, fill=color)
 
     texto_p(74, "CONFIGURACIÓN", ("Segoe UI", 14, "bold"))
     texto_p(108, "Memoria RAM (GB)", ("Segoe UI", 10, "bold"), C_GRIS)
@@ -2158,20 +3008,16 @@ def main():
                       justify="center", bg=C_CAMPO, fg="white", insertbackground="white",
                       buttonbackground="#2d4a2d", relief="flat", highlightthickness=1,
                       highlightbackground=C_BORDE, highlightcolor=C_VERDE)
-    panel_cfg.create_window(W // 2, 136, window=spin, width=90, height=32)
+    panel_cfg.create_window(W // 2, 136 + DY, window=spin, width=90, height=32)
     texto_p(163, f"Tu PC tiene {total_ram} GB · máximo permitido: {ram_max} GB", ("Segoe UI", 8), "#6f826f")
     chk = tk.Checkbutton(panel_cfg, text="Generar logs (Launcher + Juego)", variable=var_logs,
                          font=("Segoe UI", 10), bg="#142016", fg="white", activebackground="#142016",
                          activeforeground="white", selectcolor=C_CAMPO, cursor="hand2", bd=0,
                          highlightthickness=0)
-    panel_cfg.create_window(W // 2, 192, window=chk)
+    panel_cfg.create_window(W // 2, 192 + DY, window=chk)
     texto_p(213, "Se guardan en .minecraft\\Pipolauncher\\logs", ("Segoe UI", 8), "#6f826f")
-    chk_perf = tk.Checkbutton(panel_cfg, text="Perfil independiente por versión", variable=var_perfiles,
-                              font=("Segoe UI", 10), bg="#142016", fg="white", activebackground="#142016",
-                              activeforeground="white", selectcolor=C_CAMPO, cursor="hand2", bd=0,
-                              highlightthickness=0)
-    panel_cfg.create_window(W // 2, 243, window=chk_perf)
-    texto_p(264, "Mods, config, mundos y opciones separados en cada versión", ("Segoe UI", 8), "#6f826f")
+    texto_p(243, "Cada perfil tiene su propia carpeta de juego", ("Segoe UI", 9, "bold"), C_GRIS)
+    texto_p(264, "Mods, config, mundos y opciones separados · se editan con ✎", ("Segoe UI", 8), "#6f826f")
 
     def aplicar():
         try:
@@ -2183,7 +3029,6 @@ def main():
             return False
         cfg["ram"] = v
         cfg["logs"] = bool(var_logs.get())
-        cfg["perfiles"] = bool(var_perfiles.get())
         guardar_config(cfg)
         return True
 
@@ -2197,12 +3042,11 @@ def main():
             verificar_archivos()
 
     def abrir_perfil():
-        """Abre en el Explorador la carpeta de juego del perfil de la versión elegida (o .minecraft si los perfiles
-        están desactivados o la versión es anterior a 1.6)."""
-        vid = id_actual()
+        """Abre en el Explorador la carpeta de juego del perfil elegido (.minecraft si es anterior a 1.6)."""
+        perfil = perfil_actual()
         try:
-            if var_perfiles.get() and vid and not es_version_legacy(vid):
-                ruta = asegurar_perfil(vid)[1]
+            if perfil and not es_version_legacy(perfil["version"]):
+                ruta = asegurar_perfil(perfil["id"])[1]
             else:
                 ruta = carpeta_minecraft
             if os.name == "nt":
@@ -2212,20 +3056,19 @@ def main():
         except Exception as e:
             messagebox.showerror("Carpeta del perfil", f"No se pudo abrir la carpeta:\n{e}")
 
-    panel_cfg.create_window(W // 2, 306, width=220, height=40,
+    panel_cfg.create_window(W // 2, 306 + DY, width=220, height=40,
                             window=boton(panel_cfg, "GUARDAR", C_VERDE, C_VERDE_H, ("Segoe UI", 12, "bold"),
                                          guardar, fg="#0c1a0c"))
-    panel_cfg.create_window(W // 2, 348, width=220, height=30,
+    panel_cfg.create_window(W // 2, 348 + DY, width=220, height=30,
                             window=boton(panel_cfg, "Abrir carpeta del perfil", "#2a3d2a", "#3a5a3a",
                                          ("Segoe UI", 10), abrir_perfil))
-    panel_cfg.create_window(W // 2, 386, width=220, height=30,
+    panel_cfg.create_window(W // 2, 386 + DY, width=220, height=30,
                             window=boton(panel_cfg, "Verificar archivos", "#2a3d2a", "#3a5a3a",
                                          ("Segoe UI", 10), verificar))
 
     def mostrar_config():
         var_ram.set(str(cfg["ram"]))
         var_logs.set(cfg["logs"])
-        var_perfiles.set(cfg["perfiles"])
         panel_cfg.place(x=0, y=0)
         en_config[0] = True
         btn_cfg.configure(text="⌂")  # casa: vuelve a la pantalla principal sin guardar
@@ -2382,6 +3225,7 @@ def main():
 
     def arrancar():
         """Lo que antes corría al abrir: ahora va DESPUÉS de revisar (y, si corresponde, ofrecer) la actualización."""
+        mostrar_cuenta()
         refrescar_lista()
         if not cfg["instalado"] or not cfg["java_local"]:  # 2º caso: instalaciones sin revisar el Java de la PC
             ventana.after(300, preparar)
